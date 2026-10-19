@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "declaration": false,
+    "outDir": "dist-test",
+    "rootDir": ".",
+    "sourceMap": false
+  },
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/**/*",
+    "test/helpers.ts",
+    "test/intent.test.ts",
+    "test/forecast.test.ts",
+    "test/cli.test.ts",
+    "test/sync.test.ts",
+    "test/hardening.test.ts",
+    "test/github/action.test.ts",
+    "test/github/comment.test.ts",
+    "test/github/forecast.test.ts",
+    "test/github/prs.test.ts",
+    "test/github/upsert.test.ts",
+    "test/mcp/tools.test.ts",
+    "test/mcp/server.test.ts",
+    "test/claimlock/adapter.test.ts"
+  ]
+}

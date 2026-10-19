@@ -1,0 +1,65 @@
+# Ceasefire collision forecast — GitHub Action.
+#
+# Forecasts merge collisions across all open PRs (git merge-tree, pairwise)
+# and posts the collision matrix as a PR comment. Advisory by default:
+# the workflow only fails when `fail-on` opts into strictness.
+#
+# Install with `ceasefire init` (writes .github/workflows/ceasefire.yml), or by hand:
+#
+#   .github/workflows/ceasefire.yml:
+#   ```yaml
+#   name: ceasefire
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened]
+#     issue_comment:
+#       types: [created]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   jobs:
+#     forecast:
+#       # only run the comment trigger on "/ceasefire rerun"
+#       if: github.event_name == 'pull_request' ||
+#           (github.event_name == 'issue_comment' &&
+#            github.event.issue.pull_request &&
+#            contains(github.event.comment.body, '/ceasefire rerun'))
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#           with:
+#             fetch-depth: 0
+#         - uses: calasdan-sketch/ceasefire@v1
+#           with:
+#             github-token: ${{ secrets.GITHUB_TOKEN }}
+#   ```
+#
+# NOTE: this action runs from the compiled output (`dist/github/action.js`).
+# Publish with `npm run build` before tagging a release.
+
+name: 'ceasefire collision forecast'
+description: 'Forecast merge collisions across open PRs and post the collision matrix as a PR comment'
+author: 'Calas Automations'
+
+inputs:
+  github-token:
+    description: 'GitHub token with pull-requests:write for posting the forecast comment'
+    required: true
+    default: ${{ github.token }}
+  fail-on:
+    description: >
+      When to fail the workflow: 'never' (default, advisory only),
+      'advisory' (fail on any collision), or 'block' (fail only on
+      textual merge conflicts).
+    required: false
+    default: 'never'
+
+outputs:
+  verdict:
+    description: "Forecast verdict: 'clear', 'advisory', or 'block'"
+  collisions:
+    description: 'Number of collisions forecast'
+
+runs:
+  using: 'node20'
+  main: 'dist/github/action.js'

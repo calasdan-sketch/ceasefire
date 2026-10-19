@@ -1,0 +1,28 @@
+{
+  "bin": {
+    "ceasefire": "./dist/cli.js"
+  },
+  "description": "Parallel agents, zero merge fights. Intent ledger + merge-tree collision forecasting for AI agent fleets.",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist"
+  ],
+  "license": "MIT",
+  "name": "ceasefire",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "mkdir -p .test-tmp && CEASEFIRE_TEST_TMP=$PWD/.test-tmp tsc && tsc -p tsconfig.test.json && CEASEFIRE_TEST_TMP=$PWD/.test-tmp node --test dist-test/test/intent.test.js dist-test/test/forecast.test.js dist-test/test/cli.test.js dist-test/test/sync.test.js dist-test/test/hardening.test.js dist-test/test/github/action.test.js dist-test/test/github/comment.test.js dist-test/test/github/forecast.test.js dist-test/test/github/prs.test.js dist-test/test/github/upsert.test.js dist-test/test/mcp/tools.test.js dist-test/test/mcp/server.test.js dist-test/test/claimlock/adapter.test.js"
+  },
+  "type": "module",
+  "version": "0.1.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  }
+}
