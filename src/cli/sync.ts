@@ -47,6 +47,7 @@ function isValidRemoteIntent(parsed: unknown): parsed is Intent {
   // Keep absurd values out of the local DB: 10k paths or a 1MB task string
   // from a planted ref would slow every `ceasefire check`.
   if ((p['paths'] as string[]).length > 1000) return false;
+  if ((p['paths'] as string[]).some((x) => x.length > 4096)) return false;
   if (p['task'].length > 10_000 || p['agent'].length > 256 || p['branch'].length > 512) return false;
   return true;
 }

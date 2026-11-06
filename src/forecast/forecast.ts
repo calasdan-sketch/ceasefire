@@ -189,21 +189,8 @@ export function textualCollisions(
   return collisions;
 }
 
-/** Normalize a claimed path for overlap comparison. */
-export function normalizePath(p: string): string {
-  let out = p.trim().replace(/\\/g, '/');
-  out = out.replace(/^\.\//, '');
-  out = out.replace(/\/+$/, '');
-  return out;
-}
-
-/** True when two claimed paths overlap: equal, or one contains the other. */
-export function pathsOverlap(a: string, b: string): boolean {
-  const na = normalizePath(a);
-  const nb = normalizePath(b);
-  if (!na || !nb) return false;
-  return na === nb || na.startsWith(nb + '/') || nb.startsWith(na + '/');
-}
+export { normalizePath, pathsOverlap, canonicalizePath, globMatch, isGlob, PathOutsideRepoError } from './paths.js';
+import { normalizePath, pathsOverlap } from './paths.js';
 
 /**
  * Advisory intent collisions: pairs of *active, unexpired* intents from

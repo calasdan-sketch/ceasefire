@@ -21,6 +21,9 @@
     "test/github/upsert.test.ts",
     "test/mcp/tools.test.ts",
     "test/mcp/server.test.ts",
-    "test/claimlock/adapter.test.ts"
+    "test/claimlock/adapter.test.ts",
+    "test/paths.test.ts",
+    "test/worktrees.test.ts",
+    "test/hook.test.ts"
   ]
 }

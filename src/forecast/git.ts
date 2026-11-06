@@ -37,10 +37,11 @@ export interface GitResult {
  * Never throws — use when a non-zero exit still carries data (e.g.
  * `git merge-tree --write-tree` exits 1 when conflicts are found).
  */
-export function gitResult(cwd: string, args: string[]): GitResult {
+export function gitResult(cwd: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
   try {
     const stdout = execFileSync('git', args, {
       cwd,
+      ...(env !== undefined ? { env } : {}),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 64 * 1024 * 1024,
