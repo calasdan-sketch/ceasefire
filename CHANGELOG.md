@@ -2,6 +2,31 @@
 
 ## 0.2.0 — unreleased
 
+### Fixed after the independent panel review
+- **Data loss:** SQLite lock contention (SQLITE_BUSY after the 5s busy timeout) was
+  treated as corruption and moved the live database and its WAL aside, wiping every
+  agent's intents. Only SQLITE_CORRUPT / SQLITE_NOTADB now trigger recovery, and a
+  recently written WAL/SHM is never moved; contention raises a retryable error instead.
+- **Strict hook failed open:** the repo is now resolved from the edited file's path (a
+  session `cwd` outside the repo used to allow the edit silently); case-insensitive
+  repos fold case; `init --claude --strict` writes `"onFailure": "block"` (Claude Code
+  >= v2.1.295) and the hook gains a `--strict` flag.
+- **Hook latency:** intent fetches now have a timeout (`CEASEFIRE_FETCH_TIMEOUT_MS`),
+  never prompt (`GIT_TERMINAL_PROMPT=0`), are TTL-cached in the hook
+  (`CEASEFIRE_FETCH_TTL_S`), skip FETCH_HEAD, and read all intent blobs with one
+  `git cat-file --batch` (oversized blobs are no longer read at all).
+- `conflicts --worktrees` no longer fetches, so its "no ref written" claim is true.
+- File names containing `[` (Next.js `app/[id]/page.tsx`) are no longer treated as globs
+  when checked; claims accept `\[` `\]` `\*` `\?` escapes and are stored escaped when they
+  name an existing file; glob-vs-glob overlap is now segment-wise, not prefix-only.
+- Path canonicalization: Windows case folding, POSIX/MSYS paths under a Windows root,
+  `C:/repo2` vs `C:/repo` prefix confusion, drive-relative `C:x` paths (refused) and
+  `\\?\` long paths.
+- Glob matcher pre-compiles classes (was cubic on unterminated `[`); now O(pattern × path).
+- Every git call strips inherited `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`, … .
+- Docs: snapshot blobs, `gc.pruneExpire`, no size cap, LFS clean filters, transitive
+  dependency count, store.ts comment, and the 0.1.0 / "v1.0.0" history note.
+
 ### Added
 - `ceasefire conflicts --worktrees [--untracked]`: forecast collisions between git worktrees
   **including uncommitted edits**, via throwaway snapshot commits (no checkout, no ref, no
@@ -32,5 +57,5 @@
   used only by `--mcp`).
 
 ## 0.1.0
-- Initial release: intent ledger, merge-tree branch forecast, git-refs broadcast, MCP server,
+- Initial release (the first commit is titled "v1.0.0"; the package version was 0.1.0): intent ledger, merge-tree branch forecast, git-refs broadcast, MCP server,
   GitHub Action sources.

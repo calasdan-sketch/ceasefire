@@ -92,7 +92,7 @@ export function listWorktrees(cwd: string): WorktreeInfo[] {
 }
 
 function gitResultOrThrow(cwd: string, args: string[], env?: NodeJS.ProcessEnv): string {
-  const r = gitResult(cwd, args, env);
+  const r = gitResult(cwd, args, env !== undefined ? { env } : {});
   if (r.exitCode !== 0) {
     throw new CeasefireGitError(args.join(' '), r.stderr.trim() || r.stdout.trim() || 'unknown error');
   }
@@ -116,13 +116,13 @@ export function snapshotWorktree(wt: WorktreeInfo, includeUntracked = false): Wo
   try {
     const tmpIndex = join(dir, 'index');
     const realIndex = gitResultOrThrow(wt.path, ['rev-parse', '--path-format=absolute', '--git-path', 'index']);
-    const env: NodeJS.ProcessEnv = { ...process.env, ...SNAPSHOT_IDENTITY, GIT_INDEX_FILE: tmpIndex };
-    // Never let a caller's GIT_DIR/GIT_WORK_TREE redirect us to another repo.
-    delete env['GIT_DIR'];
-    delete env['GIT_WORK_TREE'];
+    // gitResult strips inherited GIT_DIR / GIT_INDEX_FILE / … from every call
+    // (including the rev-parse above); only our own temp index is set here.
+    const env: NodeJS.ProcessEnv = { ...SNAPSHOT_IDENTITY, GIT_INDEX_FILE: tmpIndex };
     if (existsSync(realIndex)) copyFileSync(realIndex, tmpIndex);
     else gitResultOrThrow(wt.path, ['read-tree', wt.head], env);
-    gitResultOrThrow(wt.path, ['add', includeUntracked ? '-A' : '-u', '--', ':/'], env);
+    // gc.auto=0 / maintenance.auto=false: a forecast must never trigger repo maintenance.
+    gitResultOrThrow(wt.path, ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'add', includeUntracked ? '-A' : '-u', '--', ':/'], env);
     const tree = gitResultOrThrow(wt.path, ['write-tree'], env);
     const headTree = git(wt.path, ['rev-parse', `${wt.head}^{tree}`]);
     if (tree === headTree) return { ...wt, label, snapshot: wt.head, dirty: false };

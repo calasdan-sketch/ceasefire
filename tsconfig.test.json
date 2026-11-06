@@ -24,6 +24,7 @@
     "test/claimlock/adapter.test.ts",
     "test/paths.test.ts",
     "test/worktrees.test.ts",
-    "test/hook.test.ts"
+    "test/hook.test.ts",
+    "test/review.test.ts"
   ]
 }

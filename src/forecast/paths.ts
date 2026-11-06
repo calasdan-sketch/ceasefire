@@ -3,15 +3,20 @@
  *
  * Agents name files in many shapes: `src/a.ts`, `./src/a.ts`,
  * `/home/me/repo/src/a.ts` (Claude Code hooks pass absolute paths),
- * `src\\a.ts` or `C:\\repo\\src\\a.ts` on Windows, or `../a.ts` from a
- * subdirectory. Two agents naming the same file differently must still
- * collide, so every claim and every checked file is reduced to one
- * canonical repo-relative POSIX form before comparison.
+ * `src\\a.ts`, `C:\\repo\\src\\a.ts`, `\\\\?\\C:\\repo\\...` or MSYS
+ * `/c/repo/...` on Windows, or `../a.ts` from a subdirectory. Two agents
+ * naming the same file differently must still collide, so every claim and
+ * every checked file is reduced to one repo-relative POSIX form.
  *
- * Claims may also be globs (`src/**\/*.test.ts`, `docs/*.md`). Matching is
- * implemented here with a linear-time segment matcher (no RegExp built from
- * user input, so a hostile pattern cannot trigger catastrophic backtracking)
- * and no dependency.
+ * Case: on case-insensitive filesystems (Windows, default macOS) callers
+ * pass `ignoreCase`, and every comparison folds case.
+ *
+ * Claims may be globs (`src/**\/*.test.ts`, `docs/*.md`, `[a-z]` classes).
+ * A metacharacter preceded by a backslash (`\\[`, `\\*`, `\\?`, `\\]`) is a
+ * literal; that is the one place a backslash is not a path separator.
+ * Files being *checked* are always literal, so `app/[id]/page.tsx` is a file
+ * name, never a pattern. Matching pre-compiles each pattern segment and runs
+ * in O(pattern x path) time; no RegExp is built from user input.
  */
 import { isAbsolute, relative, resolve, sep, dirname, basename, join } from 'node:path';
 import { realpathSync } from 'node:fs';
@@ -19,29 +24,65 @@ import { realpathSync } from 'node:fs';
 /** Longest pattern / path we accept for matching. Longer input never matches. */
 export const MAX_PATTERN_LENGTH = 4096;
 
-/** True when the string contains glob metacharacters (`*`, `?`, `[`). */
-export function isGlob(p: string): boolean {
-  return /[*?[]/.test(p);
+export interface MatchOptions {
+  /** Fold case in every comparison (case-insensitive filesystem). */
+  ignoreCase?: boolean;
 }
 
-/** Windows drive (`C:\`, `c:/`) or UNC (`\\server\share`) absolute path. */
-function isWindowsAbsolute(p: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/]/.test(p);
+/** True when the string contains an *unescaped* glob metacharacter (`*`, `?`, `[`). */
+export function isGlob(p: string): boolean {
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    if (c === '\\' && i + 1 < p.length && isMeta(p[i + 1] as string)) {
+      i++;
+      continue;
+    }
+    if (c === '*' || c === '?' || c === '[') return true;
+  }
+  return false;
+}
+
+function isMeta(c: string): boolean {
+  return c === '*' || c === '?' || c === '[' || c === ']' || c === '\\';
+}
+
+/** Remove glob escapes: `app/\[id\]` -> `app/[id]`. */
+export function unescapeGlob(p: string): string {
+  return p.replace(/\\([*?[\]\\])/g, '$1');
+}
+
+/** Escape glob metacharacters so a literal file name can be stored as a claim. */
+export function escapeGlob(p: string): string {
+  return p.replace(/([*?[\]])/g, '\\$1');
+}
+
+/** Backslashes that are path separators (i.e. not escaping a glob metachar) become `/`. */
+function slashify(p: string): string {
+  return p.replace(/\\(?![*?[\]])/g, '/');
+}
+
+/** `\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`. */
+function stripLongPathPrefix(p: string): string {
+  if (/^[\\/]{2}\?[\\/]UNC[\\/]/i.test(p)) return '\\\\' + p.slice(8);
+  if (/^[\\/]{2}\?[\\/]/.test(p)) return p.slice(4);
+  return p;
 }
 
 /**
- * Lexical normalization to a POSIX-style relative path: backslashes become
+ * Lexical normalization to a POSIX-style path: separator backslashes become
  * `/`, empty and `.` segments are dropped, `..` pops a segment. A leading
  * `..` that cannot be popped is kept (the path escapes its base).
- * Absolute inputs keep a leading `/` (or `X:/` drive) so callers can tell.
+ * Absolute inputs keep a leading `/`, `//` (UNC) or `X:/` prefix.
  */
 export function normalizePath(p: string): string {
-  let s = p.trim().replace(/\\/g, '/');
+  let s = slashify(stripLongPathPrefix(p.trim()));
   let prefix = '';
   const drive = /^([A-Za-z]:)\//.exec(s);
   if (drive) {
-    prefix = `${drive[1]}/`;
+    prefix = `${(drive[1] as string).toUpperCase()}/`;
     s = s.slice(3);
+  } else if (s.startsWith('//') && !s.startsWith('///')) {
+    prefix = '//';
   } else if (s.startsWith('/')) {
     prefix = '/';
   }
@@ -78,62 +119,86 @@ function realpathLoose(abs: string): string {
 
 export class PathOutsideRepoError extends Error {
   readonly input: string;
-  constructor(input: string) {
-    super(`path is outside the repository: ${input}`);
+  constructor(input: string, why = 'path is outside the repository') {
+    super(`${why}: ${input}`);
     this.name = 'PathOutsideRepoError';
     this.input = input;
   }
 }
 
+/** True when `p` is a Windows-style root (`C:/...`, `//server/share`). */
+function isWindowsRoot(p: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/?]/.test(p);
+}
+
+/** `child` relative to `root` when inside it ('' for the root itself), else null. */
+function relInside(child: string, root: string, ignoreCase: boolean): string | null {
+  const c = ignoreCase ? child.toLowerCase() : child;
+  const r = (ignoreCase ? root.toLowerCase() : root).replace(/\/+$/, '');
+  if (c === r) return '';
+  if (r === '' || r.endsWith(':')) return null;
+  if (c.startsWith(r + '/')) return child.slice(r.length + 1);
+  return null;
+}
+
 /**
  * Canonical repo-relative POSIX path for a claim or checked file.
  *
- * - Relative paths resolve against `cwd` (so `ceasefire check a.ts` run in
- *   `src/` means `src/a.ts`), then become relative to `repoRoot`.
- * - Absolute POSIX paths are made relative to `repoRoot` (symlinks resolved,
- *   so macOS `/tmp` vs `/private/tmp` agree).
- * - Windows absolute paths are compared case-insensitively against the root.
- * - Globs are resolved lexically (their literal prefix is anchored the same way).
+ * - Relative paths resolve against `cwd`, then become relative to `repoRoot`.
+ * - Absolute POSIX paths are made relative to `repoRoot` (symlinks resolved).
+ * - On a Windows root: drive, `\\?\` and UNC paths are compared lexically and
+ *   case-insensitively; MSYS `/c/...` maps to `C:/...`; other POSIX absolute
+ *   paths and drive-relative `C:x` paths are refused.
+ * - Globs are resolved lexically (only their literal prefix is realpath'd).
  *
  * Throws PathOutsideRepoError when the path escapes the repository.
  * Without a repo root, falls back to lexical normalization only.
  */
-export function canonicalizePath(input: string, cwd: string, repoRoot: string | null): string {
-  const raw = input.trim();
+export function canonicalizePath(
+  input: string,
+  cwd: string,
+  repoRoot: string | null,
+  opts: MatchOptions = {},
+): string {
+  const raw = stripLongPathPrefix(input.trim());
+  if (/^[A-Za-z]:(?![\\/])/.test(raw)) throw new PathOutsideRepoError(input, 'drive-relative path is ambiguous');
   if (!repoRoot) {
     const n = normalizePath(raw);
-    return n.replace(/^\/+/, '');
+    return n.replace(/^(?:[A-Z]:)?\/+/, '');
   }
-  const winAbs = isWindowsAbsolute(raw);
-  if (winAbs || /^[A-Za-z]:[\\/]/.test(repoRoot)) {
-    // Windows-style comparison: purely lexical and case-insensitive.
-    const root = normalizePath(repoRoot);
-    const target = winAbs ? normalizePath(raw) : normalizePath(`${root}/${relWinCwd(cwd, root)}/${raw}`);
-    const lr = root.toLowerCase();
-    const lt = target.toLowerCase();
-    if (lt === lr) return '';
-    if (!lt.startsWith(lr.endsWith('/') ? lr : lr + '/')) throw new PathOutsideRepoError(input);
-    return target.slice(lr.endsWith('/') ? lr.length : lr.length + 1);
+  const winRoot = isWindowsRoot(repoRoot);
+  if (winRoot || isWindowsRoot(raw)) {
+    if (!winRoot) throw new PathOutsideRepoError(input);
+    // Windows-style comparison: purely lexical, always case-insensitive.
+    const root = normalizePath(stripLongPathPrefix(repoRoot));
+    let target: string;
+    const msys = /^\/([A-Za-z])(\/|$)/.exec(raw);
+    if (isWindowsRoot(raw)) target = normalizePath(raw);
+    else if (msys) target = normalizePath(`${(msys[1] as string).toUpperCase()}:/${raw.slice(3)}`);
+    else if (raw.startsWith('/') || raw.startsWith('\\')) throw new PathOutsideRepoError(input);
+    else {
+      const c = normalizePath(stripLongPathPrefix(cwd));
+      const base = isWindowsRoot(c) && relInside(c, root, true) !== null ? c : root;
+      target = normalizePath(`${base}/${raw}`);
+    }
+    const rel = relInside(target, root, true);
+    if (rel === null) throw new PathOutsideRepoError(input);
+    return rel;
   }
+  const ignoreCase = opts.ignoreCase ?? false;
   const rootReal = realpathLoose(repoRoot);
-  let abs: string;
-  if (isAbsolute(raw)) {
-    abs = raw;
-  } else {
-    abs = resolve(realpathLoose(cwd), raw.replace(/\\/g, '/'));
-  }
+  const abs = isAbsolute(raw) ? raw : resolve(realpathLoose(cwd), slashify(raw));
   // Do not realpath glob patterns (their wildcard segments are not files).
   const real = isGlob(abs) ? resolveGlobAnchor(abs) : realpathLoose(abs);
   const rel = relative(rootReal, real).split(sep).join('/');
-  if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) throw new PathOutsideRepoError(input);
+  if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) {
+    // realpathSync keeps the caller's casing on case-insensitive volumes:
+    // `/TMP/repo/a` and `/tmp/repo/a` are one file there.
+    const inside = ignoreCase ? relInside(normalizePath(real), normalizePath(rootReal), true) : null;
+    if (inside === null) throw new PathOutsideRepoError(input);
+    return normalizePath(inside);
+  }
   return normalizePath(rel);
-}
-
-function relWinCwd(cwd: string, root: string): string {
-  const c = normalizePath(cwd);
-  const lc = c.toLowerCase();
-  const lr = root.toLowerCase();
-  return lc.startsWith(lr) ? c.slice(root.length) : '';
 }
 
 /** realpath only the literal (non-glob) leading segments of a pattern. */
@@ -149,43 +214,101 @@ function resolveGlobAnchor(abs: string): string {
 /* glob matching                                                       */
 /* ------------------------------------------------------------------ */
 
-/** Match one path segment against one pattern segment (`*`, `?`, `[...]`). */
-function matchSegment(pat: string, str: string): boolean {
-  // Iterative wildcard matcher with single backtrack point: O(len(pat)*len(str)) worst case.
+type Token =
+  | { t: 'lit'; c: string }
+  | { t: 'one' }
+  | { t: 'star' }
+  | { t: 'cls'; neg: boolean; ranges: Array<[string, string]> };
+
+/** Compile one pattern segment into tokens. Unterminated `[` is a literal. O(n). */
+function compileSegment(pat: string): Token[] {
+  const out: Token[] = [];
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i] as string;
+    if (c === '\\' && i + 1 < pat.length && isMeta(pat[i + 1] as string)) {
+      out.push({ t: 'lit', c: pat[++i] as string });
+    } else if (c === '*') {
+      if (out[out.length - 1]?.t !== 'star') out.push({ t: 'star' });
+    } else if (c === '?') {
+      out.push({ t: 'one' });
+    } else if (c === '[') {
+      const end = findClassEnd(pat, i);
+      if (end < 0) {
+        out.push({ t: 'lit', c: '[' });
+        continue;
+      }
+      let j = i + 1;
+      let neg = false;
+      if (pat[j] === '!' || pat[j] === '^') {
+        neg = true;
+        j++;
+      }
+      const ranges: Array<[string, string]> = [];
+      while (j < end) {
+        let lo = pat[j] as string;
+        if (lo === '\\' && j + 1 < end) lo = pat[++j] as string;
+        if (pat[j + 1] === '-' && j + 2 < end) {
+          let hi = pat[j + 2] as string;
+          let step = 3;
+          if (hi === '\\' && j + 3 < end) {
+            hi = pat[j + 3] as string;
+            step = 4;
+          }
+          ranges.push([lo, hi]);
+          j += step;
+        } else {
+          ranges.push([lo, lo]);
+          j++;
+        }
+      }
+      out.push({ t: 'cls', neg, ranges });
+      i = end;
+    } else {
+      out.push({ t: 'lit', c });
+    }
+  }
+  return out;
+}
+
+/** Index of the `]` closing a class opened at `start`, or -1. Single forward scan. */
+function findClassEnd(pat: string, start: number): number {
+  let j = start + 1;
+  if (pat[j] === '!' || pat[j] === '^') j++;
+  if (pat[j] === ']') j++; // `[]]` / `[!]]`: leading ] is a member
+  for (; j < pat.length; j++) {
+    if (pat[j] === '\\') {
+      j++;
+      continue;
+    }
+    if (pat[j] === ']') return j;
+  }
+  return -1;
+}
+
+function tokenMatches(tok: Token, ch: string): boolean {
+  if (tok.t === 'lit') return tok.c === ch;
+  if (tok.t === 'one') return true;
+  if (tok.t === 'cls') return tok.ranges.some(([a, b]) => ch >= a && ch <= b) !== tok.neg;
+  return false;
+}
+
+/** Match a compiled segment: classic greedy star with one backtrack point, O(len(tokens) x len(str)). */
+function matchTokens(toks: Token[], str: string): boolean {
   let p = 0;
   let s = 0;
   let starP = -1;
   let starS = 0;
   while (s < str.length) {
-    if (p < pat.length) {
-      const c = pat[p] as string;
-      if (c === '*') {
-        starP = p++;
-        starS = s;
-        continue;
-      }
-      if (c === '?') {
-        p++;
-        s++;
-        continue;
-      }
-      if (c === '[') {
-        const cls = parseClass(pat, p);
-        if (cls && cls.test(str[s] as string)) {
-          p = cls.end;
-          s++;
-          continue;
-        }
-        if (!cls && str[s] === '[') {
-          p++;
-          s++;
-          continue;
-        }
-      } else if (c === str[s]) {
-        p++;
-        s++;
-        continue;
-      }
+    const tok = toks[p];
+    if (tok !== undefined && tok.t === 'star') {
+      starP = p++;
+      starS = s;
+      continue;
+    }
+    if (tok !== undefined && tokenMatches(tok, str[s] as string)) {
+      p++;
+      s++;
+      continue;
     }
     if (starP >= 0) {
       p = starP + 1;
@@ -194,53 +317,33 @@ function matchSegment(pat: string, str: string): boolean {
     }
     return false;
   }
-  while (p < pat.length && pat[p] === '*') p++;
-  return p === pat.length;
+  while (p < toks.length && toks[p]?.t === 'star') p++;
+  return p === toks.length;
 }
 
-/** Parse `[abc]`, `[a-z]`, `[!x]` / `[^x]` at `start`; null when unterminated. */
-function parseClass(pat: string, start: number): { end: number; test: (ch: string) => boolean } | null {
-  let i = start + 1;
-  let negate = false;
-  if (pat[i] === '!' || pat[i] === '^') {
-    negate = true;
-    i++;
-  }
-  const ranges: Array<[string, string]> = [];
-  let first = true;
-  while (i < pat.length && (pat[i] !== ']' || first)) {
-    first = false;
-    const lo = pat[i] as string;
-    if (pat[i + 1] === '-' && i + 2 < pat.length && pat[i + 2] !== ']') {
-      ranges.push([lo, pat[i + 2] as string]);
-      i += 3;
-    } else {
-      ranges.push([lo, lo]);
-      i++;
-    }
-  }
-  if (i >= pat.length) return null;
-  return {
-    end: i + 1,
-    test: (ch) => ranges.some(([a, b]) => ch >= a && ch <= b) !== negate,
-  };
+/** Split a pattern into segments, keeping escaped metachars intact. */
+function patternSegments(pattern: string): string[] {
+  return normalizePath(pattern).replace(/^(?:[A-Z]:)?\/+/, '').split('/').filter(Boolean);
+}
+
+function fold(s: string, o: MatchOptions): string {
+  return o.ignoreCase ? s.toLowerCase() : s;
 }
 
 /**
- * True when repo-relative `path` matches glob `pattern`.
+ * True when literal repo-relative `path` matches glob `pattern`.
  * `**` as a whole segment matches zero or more segments; `*` and `?` never
- * cross `/`. Linear-ish DP over segments; inputs over MAX_PATTERN_LENGTH never match.
+ * cross `/`. O(pattern x path); inputs over MAX_PATTERN_LENGTH never match.
  */
-export function globMatch(pattern: string, path: string): boolean {
+export function globMatch(pattern: string, path: string, o: MatchOptions = {}): boolean {
   if (pattern.length > MAX_PATTERN_LENGTH || path.length > MAX_PATTERN_LENGTH) return false;
-  const ps = normalizePath(pattern).split('/').filter(Boolean);
-  const ss = normalizePath(path).split('/').filter(Boolean);
-  // dp[j] = pattern prefix (current i) matches path prefix of length j
+  const ps = patternSegments(fold(pattern, o)).map((seg) => (seg === '**' ? null : compileSegment(seg)));
+  const ss = literalSegments(fold(path, o));
   let dp: boolean[] = new Array<boolean>(ss.length + 1).fill(false);
   dp[0] = true;
   for (const seg of ps) {
     const next: boolean[] = new Array<boolean>(ss.length + 1).fill(false);
-    if (seg === '**') {
+    if (seg === null) {
       let any = false;
       for (let j = 0; j <= ss.length; j++) {
         any = any || (dp[j] as boolean);
@@ -248,7 +351,7 @@ export function globMatch(pattern: string, path: string): boolean {
       }
     } else {
       for (let j = 1; j <= ss.length; j++) {
-        next[j] = (dp[j - 1] as boolean) && matchSegment(seg, ss[j - 1] as string);
+        next[j] = (dp[j - 1] as boolean) && matchTokens(seg, ss[j - 1] as string);
       }
     }
     dp = next;
@@ -256,42 +359,99 @@ export function globMatch(pattern: string, path: string): boolean {
   return dp[ss.length] as boolean;
 }
 
-/** Literal leading directory of a glob (`src/auth/**\/*.ts` -> `src/auth`). */
+/** Segments of a literal path (no glob interpretation, backslashes are separators). */
+function literalSegments(p: string): string[] {
+  return p.replace(/\\/g, '/').split('/').filter((s) => s !== '' && s !== '.');
+}
+
+/** Literal leading directory of a glob (`src/auth/**\/*.ts` -> `src/auth`), unescaped. */
 export function globLiteralPrefix(pattern: string): string {
-  const segs = normalizePath(pattern).split('/').filter(Boolean);
   const out: string[] = [];
-  for (const s of segs) {
+  for (const s of patternSegments(pattern)) {
     if (isGlob(s)) break;
-    out.push(s);
+    out.push(unescapeGlob(s));
   }
   return out.join('/');
 }
 
-function prefixRelated(a: string, b: string): boolean {
-  if (a === '' || b === '') return true;
+/** Literal-path overlap: equal, or one is a directory containing the other. */
+function literalOverlap(a: string, b: string): boolean {
+  if (!a || !b) return false;
   return a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
 }
 
+/** Normalized literal form of a claim: unescaped when it has no wildcards. */
+function claimLiteral(n: string): string {
+  return unescapeGlob(n);
+}
+
 /**
- * True when two claimed paths overlap.
+ * Could two glob claims match a common path? Segment-wise NFA product with
+ * memo, O(segments(a) x segments(b)). Two wildcard segments are assumed
+ * compatible (conservative); a literal segment must match the other side.
+ */
+function globsMayIntersect(a: string, b: string, o: MatchOptions): boolean {
+  const as = patternSegments(fold(a, o));
+  const bs = patternSegments(fold(b, o));
+  const memo = new Map<number, boolean>();
+  const W = bs.length + 1;
+  const go = (i: number, j: number): boolean => {
+    const key = i * W + j;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    memo.set(key, false);
+    let r: boolean;
+    if (i === as.length && j === bs.length) r = true;
+    else if (as[i] === '**') r = go(i + 1, j) || (j < bs.length && go(i, j + 1));
+    else if (bs[j] === '**') r = go(i, j + 1) || (i < as.length && go(i + 1, j));
+    else if (i === as.length || j === bs.length) r = false;
+    else r = segmentsCompatible(as[i] as string, bs[j] as string) && go(i + 1, j + 1);
+    memo.set(key, r);
+    return r;
+  };
+  return go(0, 0);
+}
+
+function segmentsCompatible(x: string, y: string): boolean {
+  const gx = isGlob(x);
+  const gy = isGlob(y);
+  if (!gx && !gy) return unescapeGlob(x) === unescapeGlob(y);
+  if (gx && gy) return true;
+  return gx ? matchTokens(compileSegment(x), unescapeGlob(y)) : matchTokens(compileSegment(y), unescapeGlob(x));
+}
+
+/**
+ * Does a literal path (a file or directory being checked) overlap a claim?
+ *
+ * - literal claim: equal, or one is a directory containing the other.
+ * - glob claim: the file matches it; or the file is a directory that holds
+ *   the glob's literal root; or the claim's text equals the file exactly
+ *   (an unescaped `app/[id]/page.tsx` claim still covers that file).
+ */
+export function fileMatchesClaim(file: string, claim: string, o: MatchOptions = {}): boolean {
+  const f = fold(normalizePath(file.replace(/\\/g, '/')), o);
+  const c = fold(normalizePath(claim), o);
+  if (!f || !c) return false;
+  if (!isGlob(c)) return literalOverlap(f, claimLiteral(c));
+  if (f === c || globMatch(c, f)) return true;
+  const prefix = globLiteralPrefix(c);
+  return prefix !== '' && (prefix === f || prefix.startsWith(f + '/'));
+}
+
+/**
+ * True when two *claims* overlap (both may be globs).
  *
  * - literal vs literal: equal, or one is a directory containing the other.
- * - literal vs glob: the literal matches the glob, or the literal is a
- *   directory that could contain matches (it is related to the glob's
- *   literal prefix). Conservative: reports *possible* overlap.
- * - glob vs glob: their literal prefixes are related (conservative).
+ * - literal vs glob: as fileMatchesClaim.
+ * - glob vs glob: they could match a common path (conservative per segment).
  */
-export function pathsOverlap(a: string, b: string): boolean {
+export function pathsOverlap(a: string, b: string, o: MatchOptions = {}): boolean {
   const na = normalizePath(a);
   const nb = normalizePath(b);
   if (!na || !nb) return false;
   const ga = isGlob(na);
   const gb = isGlob(nb);
-  if (!ga && !gb) return na === nb || na.startsWith(nb + '/') || nb.startsWith(na + '/');
-  if (ga && gb) return prefixRelated(globLiteralPrefix(na), globLiteralPrefix(nb));
-  const [glob, lit] = ga ? [na, nb] : [nb, na];
-  if (globMatch(glob, lit)) return true;
-  // A directory claim could contain files the glob matches (or vice versa).
-  const prefix = globLiteralPrefix(glob);
-  return prefix === '' ? false : prefix.startsWith(lit + '/') || prefix === lit;
+  if (!ga && !gb) return literalOverlap(fold(claimLiteral(na), o), fold(claimLiteral(nb), o));
+  if (ga && gb) return fold(na, o) === fold(nb, o) || globsMayIntersect(na, nb, o);
+  return ga ? fileMatchesClaim(claimLiteral(nb), na, o) : fileMatchesClaim(claimLiteral(na), nb, o);
 }

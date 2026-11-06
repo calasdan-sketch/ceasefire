@@ -9,7 +9,7 @@
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { renameSync } from 'node:fs';
+import { renameSync, existsSync, statSync } from 'node:fs';
 import { findGitRoot } from '../forecast/git.js';
 
 export { IntentStore, DEFAULT_TTL_MS } from './store.js';
@@ -28,40 +28,77 @@ export function resolveDbPath(cwd: string = process.cwd()): string {
   return join(resolveStoreDir(cwd), 'intents.db');
 }
 
+/** SQLite primary result codes that mean "this file is not a usable database". */
+const SQLITE_CORRUPT = 11;
+const SQLITE_NOTADB = 26;
+/** A WAL/SHM sidecar touched this recently may belong to a live connection. */
+const LIVE_SIDECAR_MS = 60_000;
+
+/** True only for genuine corruption — never for SQLITE_BUSY/LOCKED, I/O or permission errors. */
+export function isCorruptionError(e: unknown): boolean {
+  if (typeof e !== 'object' || e === null) return false;
+  const code = (e as { errcode?: unknown }).errcode;
+  if (typeof code !== 'number') return false;
+  const primary = code & 0xff; // extended codes keep the primary code in the low byte
+  return primary === SQLITE_CORRUPT || primary === SQLITE_NOTADB;
+}
+
+export class IntentStoreBusyError extends Error {
+  constructor(dbPath: string, cause: unknown) {
+    super(
+      `the intent store ${dbPath} is busy or unavailable (${cause instanceof Error ? cause.message : String(cause)}); ` +
+        'another ceasefire process may hold a long lock. Nothing was changed — retry in a moment.',
+    );
+    this.name = 'IntentStoreBusyError';
+  }
+}
+
 /**
  * Open the intent store, recovering from a corrupt database file.
  *
- * A corrupt `intents.db` (truncated write, disk error, stray file) must not
- * take down every ceasefire command: the ledger is advisory, so we quarantine
- * the bad file (`intents.db.corrupt-<timestamp>`, kept for forensics) and
- * start fresh. Genuine errors (unwritable directory, …) still throw.
+ * Only SQLITE_CORRUPT / SQLITE_NOTADB trigger recovery: the bad file is
+ * quarantined (`intents.db.corrupt-<timestamp>`, kept for forensics) and a
+ * fresh store is created. Lock contention (SQLITE_BUSY after the busy
+ * timeout), I/O and permission errors never touch the files — they throw
+ * IntentStoreBusyError, so a slow writer can never wipe every agent's
+ * intents. WAL/SHM sidecars are moved only when stale (no write for 60s);
+ * if a sidecar looks live, recovery is refused and the error is raised.
  */
-export function openIntentStore(dbPath: string): IntentStore {
+export function openIntentStore(dbPath: string, opts: { busyTimeoutMs?: number } = {}): IntentStore {
+  let first: unknown;
   try {
-    const store = new IntentStore(dbPath);
-    // Touch the table: construction alone only validates the header.
-    // A quick read+write proves the file is actually usable.
-    store.expire();
+    const store = new IntentStore(dbPath, opts);
+    try {
+      // Touch the table: construction alone only validates the header.
+      store.expire();
+    } catch (e) {
+      store.close();
+      throw e;
+    }
     return store;
   } catch (e) {
-    let quarantined = false;
-    try {
-      renameSync(dbPath, `${dbPath}.corrupt-${Date.now()}`);
-      quarantined = true;
-    } catch {
-      // Nothing to move (or cannot move) — fall through to retry/fail.
-    }
-    if (quarantined) {
-      // Best-effort: remove WAL sidecars so the fresh DB starts clean.
-      for (const suffix of ['-wal', '-shm', '-journal']) {
-        try {
-          renameSync(`${dbPath}${suffix}`, `${dbPath}${suffix}.corrupt-${Date.now()}`);
-        } catch {
-          /* sidecar may not exist */
-        }
-      }
-      return new IntentStore(dbPath);
-    }
-    throw e;
+    first = e;
   }
+  if (!isCorruptionError(first)) throw new IntentStoreBusyError(dbPath, first);
+  const now = Date.now();
+  const sidecars = ['-wal', '-shm', '-journal'].map((s) => `${dbPath}${s}`).filter((f) => existsSync(f));
+  for (const f of sidecars) {
+    try {
+      if (now - statSync(f).mtimeMs < LIVE_SIDECAR_MS) {
+        throw new IntentStoreBusyError(dbPath, new Error(`database looks corrupt but ${f} was written recently; refusing to move a live WAL`));
+      }
+    } catch (e) {
+      if (e instanceof IntentStoreBusyError) throw e;
+    }
+  }
+  const stamp = now;
+  renameSync(dbPath, `${dbPath}.corrupt-${stamp}`);
+  for (const f of sidecars) {
+    try {
+      renameSync(f, `${f}.corrupt-${stamp}`);
+    } catch {
+      /* already gone */
+    }
+  }
+  return new IntentStore(dbPath, opts);
 }

@@ -17,8 +17,11 @@
  * advisory mode it exits 1, which Claude Code shows as a non-blocking hook
  * error, so a broken setup is visible rather than silent.
  */
-import { isAbsolute } from 'node:path';
+import { isAbsolute, dirname } from 'node:path';
+import { statSync } from 'node:fs';
+import { findGitRoot } from '../forecast/git.js';
 import { cmdCheck, type CommandResult } from './commands.js';
+import { enableFetchCaching } from './sync.js';
 import { EXIT_CLEAR, EXIT_ERROR, EXIT_ADVISORY, EXIT_BLOCKED } from '../types.js';
 
 /** Tools whose `tool_input` names a file about to be written. */
@@ -34,6 +37,8 @@ export const MAX_HOOK_INPUT_BYTES = 32 * 1024 * 1024;
 
 export interface HookOptions {
   ask: boolean;
+  /** Same as CEASEFIRE_STRICT=1: deny on collision, fail closed on any failure. */
+  strict?: boolean;
   /** True when stdin exceeded MAX_HOOK_INPUT_BYTES and was truncated. */
   overflow?: boolean;
 }
@@ -60,8 +65,26 @@ function failure(reason: string): CommandResult {
   return { exitCode: EXIT_ERROR, stdout: '', stderr: `ceasefire hook: ${reason}\n` };
 }
 
+/** Deepest existing ancestor directory of `file` that lies inside a git repo, or null. */
+function nearestRepoDir(file: string): string | null {
+  let dir = dirname(file);
+  for (let i = 0; i < 4096; i++) {
+    try {
+      if (statSync(dir).isDirectory()) return findGitRoot(dir) ? dir : null;
+    } catch {
+      /* not there yet (new file in a new directory) */
+    }
+    const up = dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+  return null;
+}
+
 /** Handle one Claude Code PreToolUse event (raw stdin text). */
 export function runClaudeHook(input: string, opts: HookOptions): CommandResult {
+  if (opts.strict) process.env.CEASEFIRE_STRICT = '1';
+  enableFetchCaching(); // one edit per call: refresh remote intents at most every CEASEFIRE_FETCH_TTL_S
   if (opts.overflow || input.length > MAX_HOOK_INPUT_BYTES) return failure('hook event exceeds the 32MB size limit');
   let event: unknown;
   try {
@@ -78,7 +101,11 @@ export function runClaudeHook(input: string, opts: HookOptions): CommandResult {
   const filePath =
     typeof toolInput === 'object' && toolInput !== null ? (toolInput as Record<string, unknown>)[field] : undefined;
   if (typeof filePath !== 'string' || filePath.trim() === '') return failure(`${toolName} event has no ${field}`);
-  const cwd = typeof e['cwd'] === 'string' && isAbsolute(e['cwd']) ? e['cwd'] : process.cwd();
+  const eventCwd = typeof e['cwd'] === 'string' && isAbsolute(e['cwd']) ? e['cwd'] : process.cwd();
+  // The repo is the one that holds the *file*, not the session's cwd: a
+  // session started in a parent folder of several worktrees edits files in
+  // repos below it, and those must still be checked (strict must not fail open).
+  const cwd = isAbsolute(filePath) ? nearestRepoDir(filePath) ?? eventCwd : eventCwd;
 
   let result: CommandResult;
   try {

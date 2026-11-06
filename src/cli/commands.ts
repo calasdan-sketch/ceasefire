@@ -7,10 +7,18 @@ import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import { mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync, renameSync, appendFileSync } from 'node:fs';
 import { IntentStore, resolveDbPath, resolveStoreDir, openIntentStore } from '../intent/index.js';
-import { pathsOverlap, buildCollisionMatrix, intentCollisions } from '../forecast/forecast.js';
-import { canonicalizePath, PathOutsideRepoError, MAX_PATTERN_LENGTH } from '../forecast/paths.js';
+import { buildCollisionMatrix, intentCollisions } from '../forecast/forecast.js';
+import {
+  canonicalizePath,
+  PathOutsideRepoError,
+  MAX_PATTERN_LENGTH,
+  fileMatchesClaim,
+  isGlob,
+  escapeGlob,
+  type MatchOptions,
+} from '../forecast/paths.js';
 import { forecastWorktrees } from '../forecast/worktrees.js';
-import { findGitRoot, currentBranch, listLocalBranches, git, CeasefireGitError } from '../forecast/git.js';
+import { findGitRoot, currentBranch, listLocalBranches, git, tryGit, CeasefireGitError } from '../forecast/git.js';
 import { broadcastIntent, fetchRemoteIntents } from './sync.js';
 import {
   formatBlockedMessage,
@@ -41,15 +49,20 @@ export interface Ctx {
  * reduce to the same string, so two agents naming one file differently
  * still collide.
  */
-export function canonicalPaths(ctx: Ctx, inputs: string[]): { paths: string[] } | { error: string } {
+export function canonicalPaths(
+  ctx: Ctx,
+  inputs: string[],
+  mode: 'files' | 'claims' = 'files',
+): { paths: string[] } | { error: string } {
   const root = findGitRoot(ctx.cwd);
+  const match = matchOptions(ctx.cwd, root);
   const out: string[] = [];
   for (const raw of inputs) {
     if (raw.trim() === '') continue;
     if (raw.length > MAX_PATTERN_LENGTH) return { error: `path longer than ${MAX_PATTERN_LENGTH} characters` };
     let p: string;
     try {
-      p = canonicalizePath(raw, ctx.cwd, root);
+      p = canonicalizePath(raw, ctx.cwd, root, match);
     } catch (e) {
       if (e instanceof PathOutsideRepoError) {
         if (ctx.outsideRepo === 'ignore') continue;
@@ -57,9 +70,33 @@ export function canonicalPaths(ctx: Ctx, inputs: string[]): { paths: string[] } 
       }
       throw e;
     }
+    // A claim naming a real file whose name contains glob metacharacters
+    // (Next.js `app/[id]/page.tsx`) is stored escaped, so it stays a literal.
+    if (mode === 'claims' && root && isGlob(p) && existsSync(join(root, p))) p = escapeGlob(p);
     if (p && !out.includes(p)) out.push(p);
   }
   return { paths: out };
+}
+
+/** Is this repository on a case-insensitive filesystem? (Windows root, git's core.ignorecase, or a `.GIT` probe.) */
+export function repoIgnoresCase(root: string | null): boolean {
+  if (!root) return false;
+  if (/^[A-Za-z]:[\\/]/.test(root) || /^[\\/]{2}[^\\/]/.test(root)) return true;
+  if (tryGit(root, ['config', '--bool', 'core.ignorecase']) === 'true') return true;
+  return existsSync(join(root, '.GIT')) && existsSync(join(root, '.git'));
+}
+
+const matchCache = new Map<string, MatchOptions>();
+
+/** Match options for comparisons in this repo (cached per root). */
+export function matchOptions(cwd: string, root: string | null = findGitRoot(cwd)): MatchOptions {
+  if (!root) return {};
+  let m = matchCache.get(root);
+  if (!m) {
+    m = { ignoreCase: repoIgnoresCase(root) };
+    matchCache.set(root, m);
+  }
+  return m;
 }
 
 /** Parse a TTL like `90s`, `30m`, `2h`, `1d`. Bounded to 1 minute .. 7 days. */
@@ -122,12 +159,16 @@ function logOverride(cwd: string, agent: string, files: string[], contentions: C
   }
 }
 
-/** Local active intents plus best-effort remote ones, deduped by id. */
-export function allActiveIntents(cwd: string, store: IntentStore, now: number): Intent[] {
+/**
+ * Local active intents plus best-effort remote ones, deduped by id.
+ * `fetch: false` reads only already-fetched broadcast refs: no network, and
+ * no ref or FETCH_HEAD is written.
+ */
+export function allActiveIntents(cwd: string, store: IntentStore, now: number, opts: { fetch?: boolean } = {}): Intent[] {
   const local = store.list({ status: 'active', now });
   const seen = new Set(local.map((i) => i.id));
   const merged = [...local];
-  for (const remote of fetchRemoteIntents(cwd)) {
+  for (const remote of fetchRemoteIntents(cwd, { fetch: opts.fetch ?? true })) {
     if (!seen.has(remote.id) && remote.status === 'active' && remote.expiresAt > now) {
       seen.add(remote.id);
       merged.push(remote);
@@ -149,6 +190,7 @@ export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): C
   const canon = canonicalPaths(ctx, files);
   if ('error' in canon) return err(canon.error);
   const normalized = canon.paths;
+  const match = matchOptions(ctx.cwd);
   if (normalized.length === 0) {
     if (ctx.outsideRepo === 'ignore') return { exitCode: EXIT_CLEAR, stdout: '' };
     return err('usage: ceasefire check <file> [<file>...] [--json]');
@@ -160,7 +202,7 @@ export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): C
     const contentions: Contention[] = [];
     for (const intent of allActiveIntents(ctx.cwd, store, now)) {
       if (intent.agent === agent) continue; // your own intents never block you
-      const overlapping = normalized.filter((f) => intent.paths.some((p) => pathsOverlap(f, p)));
+      const overlapping = normalized.filter((f) => intent.paths.some((p) => fileMatchesClaim(f, p, match)));
       if (overlapping.length > 0) {
         contentions.push({
           holder: intent.agent,
@@ -216,7 +258,7 @@ export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): C
 
 export function cmdStart(ctx: Ctx, task: string, paths: string[], ttlMs?: number): CommandResult {
   if (!task.trim()) return err('usage: ceasefire start "<task>" --paths <file> [<file>...]');
-  const canon = canonicalPaths(ctx, paths);
+  const canon = canonicalPaths(ctx, paths, 'claims');
   if ('error' in canon) return err(canon.error);
   const store = openStore(ctx.cwd);
   try {
@@ -307,7 +349,9 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
   const skipped: string[] = [];
   const store = openStore(ctx.cwd);
   try {
-    const intents = allActiveIntents(ctx.cwd, store, now);
+    // --worktrees promises a read-only run: no fetch (which writes refs/ceasefire/* and FETCH_HEAD).
+    const intents = allActiveIntents(ctx.cwd, store, now, { fetch: !opts.worktrees });
+    const match = matchOptions(ctx.cwd, root);
     let collisions;
     if (opts.worktrees) {
       const wf = forecastWorktrees(ctx.cwd, { includeUntracked: opts.untracked ?? false });
@@ -319,7 +363,7 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
       if (wf.worktrees.length < 2) {
         skipped.push('ceasefire: note — only one worktree found; add agents with `git worktree add` to compare their uncommitted work.');
       }
-      collisions = [...wf.collisions, ...intentCollisions(intents, now)];
+      collisions = [...wf.collisions, ...intentCollisions(intents, now, match)];
     } else {
       try {
         branches = listLocalBranches(ctx.cwd);
@@ -328,7 +372,7 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
       }
       collisions = buildCollisionMatrix(ctx.cwd, branches, intents, now, (a, b, reason) => {
         skipped.push(`ceasefire: warning — could not forecast ${sanitizeDisplay(a)} <-> ${sanitizeDisplay(b)}: ${sanitizeDisplay(reason)}`);
-      });
+      }, match);
     }
     const stderr = skipped.length > 0 ? skipped.join('\n') + '\n' : undefined;
     const exitCode = opts.exitCode && collisions.length > 0 ? EXIT_ADVISORY : EXIT_CLEAR;
@@ -420,8 +464,9 @@ function unclaimedFiles(cwd: string, intents: Intent[], limit = 15): string[] {
     return [];
   }
   const claimed = intents.filter((i) => i.status === 'active');
+  const match = matchOptions(cwd, root);
   return tracked
-    .filter((f) => !claimed.some((i) => i.paths.some((p) => pathsOverlap(f, p))))
+    .filter((f) => !claimed.some((i) => i.paths.some((p) => fileMatchesClaim(f, p, match))))
     .slice(0, limit);
 }
 
@@ -436,7 +481,7 @@ export function cmdSuggest(ctx: Ctx, files: string[], now: number = Date.now()):
     const holders = new Map<string, { holder: string; task: string }>();
     for (const f of normalized) {
       for (const intent of intents) {
-        if (intent.paths.some((p) => pathsOverlap(f, p))) {
+        if (intent.paths.some((p) => fileMatchesClaim(f, p, matchOptions(ctx.cwd)))) {
           holders.set(f, { holder: intent.agent, task: intent.task });
         }
       }
@@ -548,7 +593,7 @@ export const CLAUDE_HOOK_COMMAND = 'ceasefire hook claude';
  * Never clobbers: an unparseable or oddly-shaped settings file is left
  * untouched and reported; an existing ceasefire entry is not duplicated.
  */
-export function installClaudeHook(root: string): { ok: boolean; note: string } {
+export function installClaudeHook(root: string, opts: { strict?: boolean } = {}): { ok: boolean; note: string } {
   const dir = join(root, '.claude');
   const file = join(dir, 'settings.json');
   let settings: Record<string, unknown> = {};
@@ -571,7 +616,13 @@ export function installClaudeHook(root: string): { ok: boolean; note: string } {
   if (already) return { ok: true, note: 'Claude Code hook already present in .claude/settings.json' };
   pre.push({
     matcher: 'Write|Edit|MultiEdit|NotebookEdit',
-    hooks: [{ type: 'command', command: CLAUDE_HOOK_COMMAND, timeout: 30 }],
+    hooks: [
+      opts.strict
+        ? // onFailure "block": a hook that crashes, times out or is missing from
+          // PATH denies the edit instead of letting it through (Claude Code >= v2.1.295).
+          { type: 'command', command: `${CLAUDE_HOOK_COMMAND} --strict`, timeout: 30, onFailure: 'block' }
+        : { type: 'command', command: CLAUDE_HOOK_COMMAND, timeout: 30 },
+    ],
   });
   hooks['PreToolUse'] = pre;
   settings['hooks'] = hooks;
@@ -581,11 +632,13 @@ export function installClaudeHook(root: string): { ok: boolean; note: string } {
   renameSync(tmp, file);
   return {
     ok: true,
-    note: 'Claude Code PreToolUse hook added to .claude/settings.json (needs `ceasefire` on PATH: npm i -g ceasefire)',
+    note:
+      `Claude Code PreToolUse hook (${opts.strict ? 'strict, onFailure "block", needs Claude Code >= v2.1.295' : 'advisory'}) ` +
+      'added to .claude/settings.json (needs `ceasefire` on PATH: npm i -g ceasefire)',
   };
 }
 
-export function cmdInit(ctx: Ctx, opts: { claude?: boolean } = {}): CommandResult {
+export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean } = {}): CommandResult {
   const root = findGitRoot(ctx.cwd);
   if (!root) return err('not a git repository. Run `ceasefire init` inside a git checkout.');
   let gitDir: string;
@@ -646,7 +699,7 @@ export function cmdInit(ctx: Ctx, opts: { claude?: boolean } = {}): CommandResul
     notes.push('created .gitignore ignoring .ceasefire/ (intent DB is local state, never committed)');
   }
 
-  if (opts.claude) notes.push(installClaudeHook(root).note);
+  if (opts.claude) notes.push(installClaudeHook(root, { strict: opts.strict ?? false }).note);
 
   notes.push('agents: add `ceasefire check <files>` before editing shared files (1 line in AGENTS.md)');
   const body = notes.map((n) => `  - ${n}`).join('\n');

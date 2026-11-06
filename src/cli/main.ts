@@ -36,6 +36,7 @@ interface Parsed {
   untracked: boolean;
   ask: boolean;
   claude: boolean;
+  strict: boolean;
 }
 
 function parseArgs(argv: string[]): Parsed {
@@ -51,6 +52,7 @@ function parseArgs(argv: string[]): Parsed {
     untracked: false,
     ask: false,
     claude: false,
+    strict: false,
   };
   let i = 0;
   while (i < argv.length) {
@@ -76,6 +78,7 @@ function parseArgs(argv: string[]): Parsed {
       else if (name === 'untracked') out.untracked = true;
       else if (name === 'ask') out.ask = true;
       else if (name === 'claude') out.claude = true;
+      else if (name === 'strict') out.strict = true;
       else if (name === 'ttl') {
         i++;
         if (i >= argv.length) throw new Error('ceasefire: --ttl needs a value, e.g. --ttl 30m');
@@ -108,8 +111,9 @@ function parseArgs(argv: string[]): Parsed {
 const HELP = `ceasefire ${VERSION} — parallel agents, zero merge fights.
 
 Usage:
-  ceasefire init [--claude]               install pre-push hook + GitHub workflow stub
-                                          (--claude: also add a Claude Code PreToolUse hook)
+  ceasefire init [--claude [--strict]]    install pre-push hook + GitHub workflow stub
+                                          (--claude: also add a Claude Code PreToolUse hook;
+                                           --strict: hook denies collisions, onFailure "block")
   ceasefire check <files...> [--json]     pre-edit collision check (paths may be absolute)
   ceasefire start "<task>" --paths <...>  publish an intent (advisory; paths or globs like 'src/**/*.ts')
         [--ttl 30m|2h|1d]                 intent lifetime (default 4h, 1m..7d)
@@ -119,7 +123,7 @@ Usage:
         [--worktrees [--untracked]]       compare git worktrees incl. uncommitted edits
         [--exit-code]                     exit 2 when any collision is found
   ceasefire suggest [files...] [--json]   unclaimed files to work on instead
-  ceasefire hook claude [--ask]           Claude Code PreToolUse hook (reads the event on stdin)
+  ceasefire hook claude [--ask|--strict]  Claude Code PreToolUse hook (reads the event on stdin)
   ceasefire --mcp                         start MCP stdio server (ceasefire_check, ceasefire_conflicts)
 
 Exit codes: 0 clear · 1 error · 2 advisory · 3 hard block (CEASEFIRE_STRICT=1)
@@ -164,7 +168,8 @@ async function main(): Promise<void> {
   switch (parsed.command) {
     case 'init': {
       if (parsed.positionals.length > 0) fail('usage: ceasefire init [--claude]');
-      return emit(cmdInit(ctx, { claude: parsed.claude }));
+      if (parsed.strict && !parsed.claude) fail('--strict only applies to `ceasefire init --claude`');
+      return emit(cmdInit(ctx, { claude: parsed.claude, strict: parsed.strict }));
     }
     case 'check': {
       return emit(cmdCheck(ctx, parsed.positionals));
@@ -195,10 +200,10 @@ async function main(): Promise<void> {
       return emit(cmdList(ctx));
     }
     case 'hook': {
-      if (parsed.positionals.length !== 1 || parsed.positionals[0] !== 'claude') fail('usage: ceasefire hook claude [--ask]');
+      if (parsed.positionals.length !== 1 || parsed.positionals[0] !== 'claude') fail('usage: ceasefire hook claude [--ask|--strict]');
       if (process.stdin.isTTY) fail('`ceasefire hook claude` reads a Claude Code hook event on stdin; it is meant to be run by Claude Code (see `ceasefire init --claude`).');
       const input = await readStdin(MAX_HOOK_INPUT_BYTES);
-      return emit(runClaudeHook(input.text, { ask: parsed.ask, overflow: input.overflow }));
+      return emit(runClaudeHook(input.text, { ask: parsed.ask, strict: parsed.strict, overflow: input.overflow }));
     }
     case 'suggest': {
       return emit(cmdSuggest(ctx, parsed.positionals));
