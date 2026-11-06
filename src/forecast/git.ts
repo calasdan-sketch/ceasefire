@@ -17,9 +17,9 @@ export class CeasefireGitError extends Error {
 }
 
 /** Run git and return trimmed stdout. Throws CeasefireGitError on failure. */
-export function git(cwd: string, args: string[]): string {
+export function git(cwd: string, args: string[], opts: GitCallOptions = {}): string {
   const command = args.join(' ');
-  const result = gitResult(cwd, args);
+  const result = gitResult(cwd, args, opts);
   if (result.exitCode !== 0) {
     throw new CeasefireGitError(command, result.stderr.trim() || result.stdout.trim() || 'unknown error');
   }
@@ -37,13 +37,50 @@ export interface GitResult {
  * Never throws — use when a non-zero exit still carries data (e.g.
  * `git merge-tree --write-tree` exits 1 when conflicts are found).
  */
-export function gitResult(cwd: string, args: string[]): GitResult {
+/**
+ * Variables that redirect git to a different repository, index or object
+ * store. ceasefire always addresses repositories by `cwd`, so an inherited
+ * value (e.g. GIT_INDEX_FILE inside a pre-commit hook, GIT_DIR inside any
+ * hook) would silently make it read the wrong state. Stripped from every call.
+ */
+export const REDIRECTING_GIT_ENV = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_COMMON_DIR',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_NAMESPACE',
+  'GIT_PREFIX',
+  'GIT_INDEX_VERSION',
+] as const;
+
+/** process.env (or `base`) minus REDIRECTING_GIT_ENV, plus `extra`. */
+export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const k of REDIRECTING_GIT_ENV) delete env[k];
+  return { ...env, ...extra };
+}
+
+export interface GitCallOptions {
+  /** Extra env vars, applied on top of the cleaned environment. */
+  env?: NodeJS.ProcessEnv;
+  /** Kill git after this many ms (reported as a failure). */
+  timeoutMs?: number;
+  /** stdin for git. */
+  input?: string;
+}
+
+export function gitResult(cwd: string, args: string[], opts: GitCallOptions = {}): GitResult {
   try {
     const stdout = execFileSync('git', args, {
       cwd,
+      env: cleanGitEnv(opts.env),
       encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [opts.input !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       maxBuffer: 64 * 1024 * 1024,
+      ...(opts.input !== undefined ? { input: opts.input } : {}),
+      ...(opts.timeoutMs !== undefined ? { timeout: opts.timeoutMs, killSignal: 'SIGKILL' as const } : {}),
     });
     return { exitCode: 0, stdout, stderr: '' };
   } catch (e) {
@@ -64,9 +101,9 @@ export function gitResult(cwd: string, args: string[]): GitResult {
 }
 
 /** Best-effort variant: returns null instead of throwing. */
-export function tryGit(cwd: string, args: string[]): string | null {
+export function tryGit(cwd: string, args: string[], opts: GitCallOptions = {}): string | null {
   try {
-    return git(cwd, args);
+    return git(cwd, args, opts);
   } catch {
     return null;
   }

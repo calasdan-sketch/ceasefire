@@ -1,7 +1,7 @@
 /**
  * Intent store: SQLite-backed CRUD with TTL expiry.
  *
- * Zero runtime dependencies — uses node:sqlite (built into Node >= 22).
+ * No npm dependency — uses node:sqlite (built into Node, unflagged since 22.13).
  * better-sqlite3 was rejected: it needs node-gyp compilation at install
  * time, which breaks `npx ceasefire` on machines without a toolchain.
  */
@@ -72,9 +72,10 @@ function rowToIntent(row: IntentRow): Intent {
 export class IntentStore {
   private db: DatabaseSync;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, opts: { busyTimeoutMs?: number } = {}) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
+    const busy = opts.busyTimeoutMs ?? 5000;
     // Concurrency hardening: parallel agents routinely `ceasefire start` (write)
     // while another runs `ceasefire check` (which expires intents — also a
     // write). Without these, the loser gets SQLITE_BUSY instantly and the
@@ -83,7 +84,7 @@ export class IntentStore {
     // - journal_mode=WAL: readers never block writers (and vice versa).
     // - synchronous=NORMAL: the safe pairing for WAL; durability is not
     //   critical here — intents are advisory and re-broadcast on publish.
-    this.db.exec('PRAGMA busy_timeout = 5000');
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busy))}`);
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec('PRAGMA synchronous = NORMAL');
     this.db.exec(SCHEMA);

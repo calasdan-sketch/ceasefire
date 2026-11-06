@@ -189,27 +189,22 @@ export function textualCollisions(
   return collisions;
 }
 
-/** Normalize a claimed path for overlap comparison. */
-export function normalizePath(p: string): string {
-  let out = p.trim().replace(/\\/g, '/');
-  out = out.replace(/^\.\//, '');
-  out = out.replace(/\/+$/, '');
-  return out;
-}
-
-/** True when two claimed paths overlap: equal, or one contains the other. */
-export function pathsOverlap(a: string, b: string): boolean {
-  const na = normalizePath(a);
-  const nb = normalizePath(b);
-  if (!na || !nb) return false;
-  return na === nb || na.startsWith(nb + '/') || nb.startsWith(na + '/');
-}
+export {
+  normalizePath,
+  pathsOverlap,
+  fileMatchesClaim,
+  canonicalizePath,
+  globMatch,
+  isGlob,
+  PathOutsideRepoError,
+} from './paths.js';
+import { normalizePath, pathsOverlap, type MatchOptions } from './paths.js';
 
 /**
  * Advisory intent collisions: pairs of *active, unexpired* intents from
  * *different* agents with overlapping paths.
  */
-export function intentCollisions(intents: Intent[], now: number = Date.now()): Collision[] {
+export function intentCollisions(intents: Intent[], now: number = Date.now(), match: MatchOptions = {}): Collision[] {
   const live = intents.filter((i) => i.status === 'active' && i.expiresAt > now);
   const collisions: Collision[] = [];
   for (let i = 0; i < live.length; i++) {
@@ -219,7 +214,7 @@ export function intentCollisions(intents: Intent[], now: number = Date.now()): C
       if (a.agent === b.agent) continue;
       const files = [
         ...new Set(
-          a.paths.flatMap((pa) => b.paths.filter((pb) => pathsOverlap(pa, pb)).map((pb) => normalizePath(pb))),
+          a.paths.flatMap((pa) => b.paths.filter((pb) => pathsOverlap(pa, pb, match)).map((pb) => normalizePath(pb))),
         ),
       ].sort();
       if (files.length > 0) {
@@ -243,6 +238,7 @@ export function buildCollisionMatrix(
   intents: Intent[],
   now: number = Date.now(),
   onSkipPair?: (a: string, b: string, reason: string) => void,
+  match: MatchOptions = {},
 ): Collision[] {
-  return [...textualCollisions(cwd, branches, onSkipPair), ...intentCollisions(intents, now)];
+  return [...textualCollisions(cwd, branches, onSkipPair), ...intentCollisions(intents, now, match)];
 }

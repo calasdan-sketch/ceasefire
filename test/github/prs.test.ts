@@ -113,9 +113,16 @@ test('REST fallback without a token throws a helpful error instead of burning ra
   const enoent: ExecFn = async () => { throw new Error('spawn gh ENOENT'); };
   let fetched = false;
   const fetchImpl: FetchFn = async () => { fetched = true; return new Response('[]', { status: 200 }); };
-  await assert.rejects(
-    () => listOpenPRs({ owner: OWNER, repo: REPO, exec: enoent, fetchImpl }),
-    /token/i,
-  );
+  // Hermetic: a GITHUB_TOKEN in the developer's or CI's env must not leak in.
+  const saved = process.env['GITHUB_TOKEN'];
+  delete process.env['GITHUB_TOKEN'];
+  try {
+    await assert.rejects(
+      () => listOpenPRs({ owner: OWNER, repo: REPO, exec: enoent, fetchImpl }),
+      /token/i,
+    );
+  } finally {
+    if (saved !== undefined) process.env['GITHUB_TOKEN'] = saved;
+  }
   assert.equal(fetched, false);
 });

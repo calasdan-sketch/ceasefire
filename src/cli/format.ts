@@ -19,8 +19,19 @@ import type { Verdict } from '../types.js';
  * JSON output is unaffected (JSON.stringify escapes control chars).
  */
 export function sanitizeDisplay(s: string): string {
-  return s.replace(/[\x00-\x1f\x7f]/g, '');
+  return s
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    .replace(INVISIBLE_RE, (ch) => `<U+${(ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}>`);
 }
+
+/**
+ * C1 controls (U+0080-U+009F, e.g. the 8-bit CSI U+009B that some terminals
+ * honour), bidi overrides/isolates (Trojan Source, CVE-2021-42574),
+ * zero-width and other invisible format characters, and line/paragraph
+ * separators. These are made *visible* rather than stripped: an agent named
+ * "hermes<U+200B>" must not display as a convincing "hermes".
+ */
+const INVISIBLE_RE = /[\u0080-\u009f\u00ad\u061c\u115f\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\u3164\ufeff\uffa0\ufff9-\ufffb]/g;
 
 export interface Contention {
   holder: string;
@@ -76,7 +87,7 @@ export function formatBlockedMessage(report: CheckReport): string {
   }
   lines.push('Recommended next actions:');
   lines.push('  1. Pick different files: run `ceasefire suggest` for unclaimed alternatives you can work on now.');
-  const holders = [...new Set(report.contentions.map((c) => c.holder))].map((h) => `"${h}"`).join(', ');
+  const holders = [...new Set(report.contentions.map((c) => c.holder))].map((h) => `"${sanitizeDisplay(h)}"`).join(', ');
   lines.push(`  2. Coordinate with the holder (${holders}) before touching these files.`);
   lines.push('  3. Wait for the holder to release the intent (`ceasefire done`), or for it to expire.');
   lines.push(
