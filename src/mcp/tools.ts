@@ -292,6 +292,10 @@ export async function runClaimTool(bin: string, input: ClaimInput, opts: Ceasefi
   if (input.task.trim() === '' || input.paths.length === 0) {
     return { content: [{ type: 'text', text: 'ceasefire_claim needs a task and at least one path.' }], isError: true };
   }
+  const flagLike = input.paths.find((p) => p.startsWith('-'));
+  if (flagLike !== undefined) {
+    return { content: [{ type: 'text', text: `ceasefire_claim: a path may not start with "-" (got "${flagLike.slice(0, 40)}"); write it as ./${flagLike.slice(0, 40)}.` }], isError: true };
+  }
   const args = ['start', '--json', ...(input.ttl ? ['--ttl', input.ttl] : []), '--paths', ...input.paths, '--', input.task];
   const res = await invokeCeasefireJson(bin, args, runOptions(opts, input.cwd));
   return toMcpResult(res);

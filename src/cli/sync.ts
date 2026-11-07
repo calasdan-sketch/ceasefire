@@ -24,7 +24,7 @@ const MAX_REF_SCAN = 5000;
 /** The longest lifetime `ceasefire start --ttl` allows; a broadcast claiming more is not from ceasefire. */
 const MAX_INTENT_LIFETIME_MS = 7 * 86_400_000;
 /** Clock-skew allowance between machines. */
-const CLOCK_SKEW_MS = 3_600_000;
+const CLOCK_SKEW_MS = 86_400_000;
 /** An expired or finished intent ref is deleted once it has been dead this long. */
 const PRUNE_GRACE_MS = 86_400_000;
 /** Upper bound on a single intent blob — the local DB must not bloat. */
@@ -53,10 +53,10 @@ export function isValidRemoteIntent(parsed: unknown, now: number = Date.now()): 
   if (!Array.isArray(p['paths']) || !p['paths'].every((x) => typeof x === 'string')) return false;
   if (!Number.isFinite(p['createdAt']) || !Number.isFinite(p['expiresAt'])) return false;
   if (p['status'] !== 'active' && p['status'] !== 'done' && p['status'] !== 'expired') return false;
-  // A planted claim that never expires (or starts in the future) would hold files for every agent, and under
-  // strict mode block their edits, forever. ceasefire itself never publishes more than 7 days.
+  // A planted claim that never expires would hold files for every agent, and under strict mode block their
+  // edits, forever. ceasefire itself never publishes more than 7 days; a day of clock skew is tolerated, because
+  // dropping a real peer's intents silently is worse than holding a forged one for a day.
   if ((p['expiresAt'] as number) > now + MAX_INTENT_LIFETIME_MS + CLOCK_SKEW_MS) return false;
-  if ((p['createdAt'] as number) > now + CLOCK_SKEW_MS) return false;
   // Keep absurd values out of the local DB: 10k paths or a 1MB task string
   // from a planted ref would slow every `ceasefire check`.
   if ((p['paths'] as string[]).length > 1000) return false;
@@ -77,7 +77,9 @@ function gitWithStdin(cwd: string, args: string[], input: string): string {
 export function broadcastIntent(cwd: string, intent: Intent): boolean {
   if (!syncEnabled(cwd)) return false;
   try {
-    const blob = gitWithStdin(cwd, ['hash-object', '-w', '--stdin'], JSON.stringify(intent));
+    // A finished intent records when it finished, so pruning can leave it up long enough for peers to learn it is done.
+    const sent = intent.status !== 'active' && intent.completedAt === undefined ? { ...intent, completedAt: Date.now() } : intent;
+    const blob = gitWithStdin(cwd, ['hash-object', '-w', '--stdin'], JSON.stringify(sent));
     const ref = `${REF_PREFIX}${intent.id}`;
     git(cwd, ['update-ref', ref, blob]);
     // Force is required: the ref points at a blob (non-commit), and git
@@ -215,7 +217,8 @@ function readIntentRefs(cwd: string, now: number): RefScan {
       if (paired) stale.push((wanted[k] as { ref: string }).ref);
       return;
     }
-    const dead = (parsed.status !== 'active' && parsed.createdAt < now - PRUNE_GRACE_MS) || parsed.expiresAt < now - PRUNE_GRACE_MS;
+    const finishedAt = typeof (parsed as { completedAt?: unknown }).completedAt === 'number' ? (parsed as { completedAt: number }).completedAt : parsed.createdAt;
+    const dead = (parsed.status !== 'active' && finishedAt < now - PRUNE_GRACE_MS) || parsed.expiresAt < now - PRUNE_GRACE_MS;
     if (paired && dead) stale.push((wanted[k] as { ref: string }).ref);
     intents.push(parsed);
   });
@@ -228,7 +231,7 @@ function readIntentRefs(cwd: string, now: number): RefScan {
 /**
  * Delete intent refs that nothing needs any more, locally and on origin, at most once per
  * PRUNE_INTERVAL. Without this, every `ceasefire start` leaves a ref behind forever, the
- * list grows without bound, and (before 0.3) the oldest 500 hid the newest. Only refs in
+ * list grows without bound, and the oldest 500 names hid the newest. Only refs in
  * refs/ceasefire/intents/ are touched, and only ones that are finished, long expired,
  * malformed or oversized. Best-effort: never throws.
  */

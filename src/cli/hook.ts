@@ -21,7 +21,7 @@ import { isAbsolute, dirname } from 'node:path';
 import { statSync } from 'node:fs';
 import { findGitRoot } from '../forecast/git.js';
 import { cmdCheck, claimLease, releaseLeases, type CommandResult } from './commands.js';
-import { enableFetchCaching } from './sync.js';
+import { enableFetchCaching, pruneIntentRefs } from './sync.js';
 import { EXIT_CLEAR, EXIT_ERROR, EXIT_ADVISORY, EXIT_BLOCKED } from '../types.js';
 
 /** Tools whose `tool_input` names a file about to be written. */
@@ -109,7 +109,10 @@ export function runReleaseHook(input: string): CommandResult {
     const rec = e as Record<string, unknown>;
     adoptSessionIdentity(rec);
     const cwd = typeof rec['cwd'] === 'string' && isAbsolute(rec['cwd']) ? rec['cwd'] : process.cwd();
-    if (findGitRoot(cwd)) releaseLeases({ cwd, json: true });
+    if (findGitRoot(cwd)) {
+      releaseLeases({ cwd, json: true });
+      pruneIntentRefs(cwd); // session end is not latency critical: the place to tidy dead refs (at most hourly)
+    }
   } catch {
     /* releasing is best-effort; the TTL is the backstop */
   }

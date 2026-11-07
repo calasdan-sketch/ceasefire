@@ -21,6 +21,8 @@ export interface Intent {
   /** Unix epoch ms when the intent lapses if not completed. */
   expiresAt: number;
   status: 'active' | 'done' | 'expired';
+  /** Set on the broadcast copy of a finished intent (not stored locally): when it finished. */
+  completedAt?: number;
 }
 
 /**

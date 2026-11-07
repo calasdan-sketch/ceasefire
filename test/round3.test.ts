@@ -101,7 +101,7 @@ test('relatedTips matches git merge-base --is-ancestor on a branchy history', ()
   git(repo, ['checkout', '-q', 'main']);
   const names = ['main', 'x1', 'x2', 'y1', 'merged'];
   const oid = new Map(names.map((n) => [n, git(repo, ['rev-parse', n])]));
-  const related = relatedTips(repo, [...oid.values()]);
+  const related = relatedTips(repo, [...oid.values()], { force: true });
   const isAnc = (a: string, b: string): boolean => spawnSync('git', ['merge-base', '--is-ancestor', a, b], { cwd: repo }).status === 0;
   for (const a of names) {
     for (const b of names) {
@@ -117,7 +117,7 @@ test('relatedTips with 40 tips crosses the 32-bit word boundary correctly', () =
   for (let i = 0; i < 40; i++) makeBranch(repo, `t${i}`, { [`f${i}.txt`]: `${i}\n` }, i % 3 === 0 ? 'main' : `t${i - 1}`);
   const names = Array.from({ length: 40 }, (_, i) => `t${i}`);
   const oid = new Map(names.map((n) => [n, git(repo, ['rev-parse', n])]));
-  const related = relatedTips(repo, [...oid.values()]);
+  const related = relatedTips(repo, [...oid.values()], { force: true });
   const isAnc = (a: string, b: string): boolean => spawnSync('git', ['merge-base', '--is-ancestor', a, b], { cwd: repo }).status === 0;
   for (const a of names) for (const b of names) assert.equal(related(oid.get(a)!, oid.get(b)!), a === b || isAnc(a, b) || isAnc(b, a), `${a} ~ ${b}`);
 });
@@ -162,8 +162,9 @@ test('remote intents that outlive the 7-day maximum or start in the future are r
   assert.equal(isValidRemoteIntent({ ...base, expiresAt: NOW + 7 * 86_400_000 }, NOW), true, 'exactly the maximum is fine');
   assert.equal(isValidRemoteIntent({ ...base, expiresAt: 9_999_999_999_999 }, NOW), false, 'planted claim that never expires');
   assert.equal(isValidRemoteIntent({ ...base, expiresAt: NOW + 30 * 86_400_000 }, NOW), false);
-  assert.equal(isValidRemoteIntent({ ...base, createdAt: NOW + 86_400_000 }, NOW), false, 'created in the future');
-  assert.equal(isValidRemoteIntent({ ...base, createdAt: NOW + 1000 }, NOW), true, 'small clock skew is tolerated');
+  assert.equal(isValidRemoteIntent({ ...base, createdAt: NOW + 3 * 3_600_000, expiresAt: NOW + 7 * 3_600_000 }, NOW), true, 'a peer whose clock runs hours fast is not silently dropped');
+  assert.equal(isValidRemoteIntent({ ...base, expiresAt: NOW + 7 * 86_400_000 + 23 * 3_600_000 }, NOW), true, 'under a day of skew on the lifetime is tolerated');
+  assert.equal(isValidRemoteIntent({ ...base, expiresAt: NOW + 9 * 86_400_000 }, NOW), false);
 });
 
 function withSync<T>(fn: () => T): T {
@@ -209,7 +210,9 @@ test('pruneIntentRefs deletes dead, malformed and oversized refs, keeps live one
   withSync(() => {
     plant(repo, 'live', { ...base, id: 'live', createdAt: now, expiresAt: now + 3_600_000 });
     plant(repo, 'dead', { ...base, id: 'dead', createdAt: now - 5 * 86_400_000, expiresAt: now - 3 * 86_400_000 });
-    plant(repo, 'finished', { ...base, id: 'finished', createdAt: now - 2 * 86_400_000, expiresAt: now + 86_400_000, status: 'done' });
+    plant(repo, 'finished', { ...base, id: 'finished', createdAt: now - 2 * 86_400_000, expiresAt: now + 86_400_000, status: 'done', completedAt: now - 2 * 86_400_000 });
+    // long-running intent finished a minute ago: peers must get time to learn it is done
+    plant(repo, 'justfinished', { ...base, id: 'justfinished', createdAt: now - 6 * 86_400_000, expiresAt: now + 86_400_000, status: 'done', completedAt: now - 60_000 });
     plant(repo, 'justdone', { ...base, id: 'justdone', createdAt: now - 60_000, expiresAt: now + 86_400_000, status: 'done' });
     plant(repo, 'junk', 'not json {{{');
     plant(repo, 'huge', { ...base, id: 'huge', task: 'x'.repeat(100_000) });
@@ -217,12 +220,24 @@ test('pruneIntentRefs deletes dead, malformed and oversized refs, keeps live one
     const n = pruneIntentRefs(repo, now);
     assert.equal(n, 4, 'dead, finished (a day old), junk, huge');
     const left = git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/ceasefire/intents/']).split('\n').sort();
-    assert.deepEqual(left, ['ceasefire/intents/justdone', 'ceasefire/intents/live'].sort());
+    assert.deepEqual(left, ['ceasefire/intents/justdone', 'ceasefire/intents/justfinished', 'ceasefire/intents/live'].sort());
     const remote = git(bare, ['for-each-ref', '--format=%(refname:short)', 'refs/ceasefire/intents/']).split('\n').sort();
     assert.deepEqual(remote, left, 'the remote copies are gone too');
     plant(repo, 'dead2', { ...base, id: 'dead2', createdAt: now - 5 * 86_400_000, expiresAt: now - 3 * 86_400_000 });
     assert.equal(pruneIntentRefs(repo, now + 60_000), 0, 'at most once per hour');
     assert.equal(pruneIntentRefs(repo, now + 2 * 3_600_000), 1);
+  });
+});
+
+test('a finished intent is broadcast with its completion time', () => {
+  const bare = tempDir('ceasefire-done-bare-');
+  git(bare, ['init', '--bare', '-q']);
+  const repo = makeRepo();
+  git(repo, ['remote', 'add', 'origin', bare]);
+  withSync(() => {
+    assert.equal(broadcastIntent(repo, { ...base, id: 'fin', status: 'done' }), true);
+    const blob = git(bare, ['cat-file', '-p', 'refs/ceasefire/intents/fin']);
+    assert.equal(typeof JSON.parse(blob).completedAt, 'number');
   });
 });
 
@@ -236,6 +251,47 @@ test('pruneIntentRefs never touches other refs and is a no-op with CEASEFIRE_SYN
     delete process.env.CEASEFIRE_SYNC;
   }
   assert.equal(git(repo, ['tag']), 'v1');
+});
+
+test('a repository path containing the alternates separator still works inside the quarantine', { skip: process.platform === 'win32' }, () => {
+  const parent = tempDir('ceasefire-colon:dir-');
+  const repo = join(parent, 'repo:one');
+  mkdirSync(repo);
+  git(repo, ['init', '-q', '-b', 'main']);
+  git(repo, ['config', 'user.email', 't@t.t']);
+  git(repo, ['config', 'user.name', 't']);
+  writeFileSync(join(repo, 'f.txt'), '1\n2\n3\n');
+  git(repo, ['add', '.']);
+  git(repo, ['commit', '-qm', 'base']);
+  for (const [b, v] of [['p', 'P'], ['q', 'Q']] as const) {
+    git(repo, ['checkout', '-q', '-b', b, 'main']);
+    writeFileSync(join(repo, 'f.txt'), `1\n${v}\n3\n`);
+    git(repo, ['commit', '-qam', b]);
+  }
+  git(repo, ['checkout', '-q', 'main']);
+  const r = cli(['conflicts', '--json'], { cwd: repo, env: { CEASEFIRE_AGENT: 'me' } });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).collisionCount, 1, r.stderr);
+  assert.equal(r.stderr.includes('warning'), false, r.stderr);
+});
+
+test('MCP claim refuses paths that look like flags', async () => {
+  const r = await runClaimTool(CLI, { task: 't', paths: ['--ttl', '1m'] });
+  assert.equal(r.isError, true);
+  assert.match(r.content[0]!.text, /may not start with "-"/);
+});
+
+test('adaptive ancestry never changes results: small repo (equality only) and forced walk agree', () => {
+  const repo = collidingRepo();
+  git(repo, ['branch', 'older', 'main']);
+  makeBranch(repo, 'a2', { 'other.txt': 'a2\n' }, 'a');
+  const names = ['main', 'older', 'a', 'a2', 'b', 'c'];
+  const oid = new Map(names.map((n) => [n, git(repo, ['rev-parse', n])]));
+  const adaptive = relatedTips(repo, [...oid.values()]);
+  const forced = relatedTips(repo, [...oid.values()], { force: true });
+  assert.equal(adaptive(oid.get('main')!, oid.get('older')!), true, 'equal tips are always related');
+  assert.equal(forced(oid.get('a')!, oid.get('a2')!), true);
+  assert.deepEqual(textualCollisions(repo, names), textualCollisions(repo, names, undefined, { related: forced }));
 });
 
 /* ----------------------------- start heads-up ----------------------------- */
@@ -266,6 +322,17 @@ test('start tells the second agent who already holds its paths, and who claimed 
   assert.deepEqual(parsed.contested.map((c) => c.holder).sort(), ['alice', 'bob']);
   assert.ok(parsed.contested.every((c) => c.claimedFirst));
   assert.deepEqual(parsed.warnings, []);
+});
+
+test('the start heads-up escapes terminal controls and bidi tricks from other agents', () => {
+  const repo = makeRepo();
+  const evil = 'bu\u001b[2Jil\u202eder\u200b';
+  const e = cli(['start', 'do \u001b]0;pwned\u0007 it', '--paths', 'file.txt'], { cwd: repo, env: { CEASEFIRE_AGENT: evil } });
+  assert.equal(e.code, 0);
+  const r = cli(['start', 'mine', '--paths', 'file.txt'], { cwd: repo, env: { CEASEFIRE_AGENT: 'victim' } });
+  assert.doesNotMatch(r.stdout, /[\u001b\u0007\u202e\u200b]/);
+  assert.match(r.stdout, /<U\+202E>/);
+  assert.match(r.stdout, /heads-up/);
 });
 
 test('start warns when a claim covers most of the repository, and when the agent name is a guess', () => {

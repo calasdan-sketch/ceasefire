@@ -23,15 +23,29 @@ stepping on each other's files. Three mechanisms:
    every file a session edits, named after the session, so parallel sessions warn each other
    with no `ceasefire start`, and a crashed session frees its files by itself.
 
+6. **Read-only forecasts, tidy ledger (new in 0.3)** — forecasts write nothing into your repository
+   (merge results and worktree snapshots live in a temporary object directory that is deleted
+   afterwards), fast-forward branch pairs are skipped exactly, and finished broadcast intents are
+   pruned instead of piling up as refs.
+7. **Works for agents without the Claude hook (new in 0.3)** — `ceasefire check --claim` and the MCP
+   tools `ceasefire_claim` / `ceasefire_release` / `ceasefire_status` give Codex, Cursor or any MCP client the
+   same "say what you are editing, hear who else is" loop; `ceasefire doctor` tells you what is missing.
+
 No daemon. No lock server. Advisory by default, strict opt-in.
 
 ## Quick start (60 seconds)
 
 ```sh
-npm i -g ceasefire                 # or use `npx ceasefire ...`
+git clone https://github.com/calasdan-sketch/ceasefire && cd ceasefire
+npm ci && npm run build && npm link   # puts `ceasefire` on PATH (0.3 is not on npm yet, see below)
 cd your-repo
+export CEASEFIRE_AGENT=my-agent    # a different name per agent; agents that share a name never warn each other
 ceasefire init --claude            # pre-push hook + workflow stub + Claude Code hook
+ceasefire doctor                   # what is installed, what is missing
 ```
+
+The npm name `ceasefire` currently resolves to version 0.0.1 (checked 2026-11-07), not this code, so
+`npm i -g ceasefire` would not give you the features described here until 0.3 is published.
 
 Synthetic demo (two agents, made-up names):
 
@@ -48,6 +62,12 @@ Files in contention:
 Recommended next actions:
   1. Pick different files: run `ceasefire suggest` for unclaimed alternatives you can work on now.
   ...
+
+$ CEASEFIRE_AGENT=reviewer ceasefire start "fix session bug" --paths src/auth/session.ts
+ceasefire: intent 8c1d77e0 published by "reviewer" on fix/session (expires in 3h 59m). Release with `ceasefire done`.
+ceasefire: heads-up — 1 other intent(s) already hold some of these paths:
+  "builder" on feat/login (1f0c9a2e, "refactor login", expires in 3h 58m): src/auth/session.ts — claimed before you
+  The earlier claim keeps priority. If theirs is earlier, pick other files (`ceasefire suggest`) or coordinate before editing.
 
 $ ceasefire conflicts --worktrees
 ceasefire: 1 collision(s) across 3 worktree(s) (2 with uncommitted changes):
@@ -80,8 +100,8 @@ ceasefire done
 | Command | Effect |
 |---|---|
 | `ceasefire init [--claude] [--statusline]` | Installs advisory pre-push hook + `.github/workflows/ceasefire.yml` stub; `--claude` also merges the PreToolUse (auto-lease) and SessionEnd hooks into `.claude/settings.json`; `--statusline` fills an empty `statusLine` slot |
-| `ceasefire check <files...> [--json]` | Pre-edit collision check |
-| `ceasefire start "<task>" --paths <...> [--ttl 30m]` | Publish an intent (default 4h TTL, 1m–7d; broadcast via git refs). Paths may be files, directories or globs |
+| `ceasefire check <files...> [--json] [--claim] [--stdin]` | Pre-edit collision check. `--claim` also holds the files (auto-lease, for agents without the Claude hook); `--stdin` reads more names from a pipe (`git diff --name-only \| ceasefire check --stdin`). `.git/` paths are ignored; outside a repository it is an error, not "clear" |
+| `ceasefire start "<task>" --paths <...> [--ttl 30m]` | Publish an intent (default 4h TTL, 1m–7d; broadcast via git refs). Paths may be files, directories or globs. Tells you who already holds some of the paths and who claimed first, and warns when the claim covers most of the repository or your agent name is only a guess |
 | `ceasefire done [--id <id>]` | Complete your active intent |
 | `ceasefire list [--json]` | Active intents from every agent |
 | `ceasefire conflicts [--json] [--exit-code]` | Collision matrix: textual (branches) + intent (agents) |
@@ -93,7 +113,8 @@ ceasefire done
 | `ceasefire done --all` | Complete all of your intents |
 | `ceasefire hook claude [--ask] [--strict] [--claim]` | Claude Code PreToolUse hook (run by Claude Code, reads stdin); `--claim` = auto-lease |
 | `ceasefire hook release` | Claude Code SessionEnd hook: free this session's leases |
-| `ceasefire --mcp` | MCP stdio server (`ceasefire_check`, `ceasefire_conflicts`) |
+| `ceasefire doctor [--json]` | Checks Node/git versions, ledger, agent name, Claude hook, `ceasefire` on PATH, pre-push hook, remote sync |
+| `ceasefire --mcp` | MCP stdio server: `ceasefire_check`, `ceasefire_conflicts` (optional `deep`, `worktrees`), `ceasefire_claim`, `ceasefire_release`, `ceasefire_status` |
 
 Exit codes: `0` clear · `1` error · `2` advisory · `3` hard block.
 `conflicts` exits `0` unless `--exit-code` is given (then `2` on any collision).
@@ -131,7 +152,7 @@ an unparseable file is left untouched):
 `ceasefire init --claude --strict` writes a gate instead:
 
 ```json
-{ "type": "command", "command": "ceasefire hook claude --strict", "timeout": 30, "onFailure": "block" }
+{ "type": "command", "command": "ceasefire hook claude --strict --claim", "timeout": 30, "onFailure": "block" }
 ```
 
 Behaviour ([hook protocol](https://code.claude.com/docs/en/hooks)): clear edits get no output;
@@ -179,7 +200,7 @@ on object ids and blobs read with `git cat-file`: nothing is checked out and no 
   (29% precision in the benchmark below); use it as a "read both diffs" nudge, not a gate.
 - `--neighbors` adds import-graph neighbors (low confidence, 17% precision); off by default.
 
-Cost: `--deep` runs one `merge-base` per pair, 3.6 s for 40 branches (780 pairs) in the benchmark.
+Cost: `--deep` runs one `merge-base` per pair that is not a fast-forward, about 3.7 s for 40 branches (780 pairs) in the benchmark.
 
 ### Worktree forecast details
 
@@ -190,16 +211,32 @@ Intent collisions in this mode use only intent refs already fetched; nothing is 
 
 What that writes, honestly:
 
-- The content of **modified tracked files** (and, with `--untracked`, of new non-ignored
-  files) is stored as unreferenced loose objects in the local object store. They are never
-  pushed. `git gc` deletes them only once they are older than `gc.pruneExpire`
-  (2 weeks by default).
+- **Nothing in your repository's object store (new in 0.3).** Every object a forecast creates
+  (snapshot blobs and commits, merge-result trees) goes to a temporary directory
+  (`GIT_OBJECT_DIRECTORY`, with the real store attached read-only as an alternate) that is deleted when the
+  command ends. Before, one forecast across 81 branches left about 7,300 loose objects (30 MB) behind
+  until `git gc` pruned them two weeks later. If git cannot report its objects directory the forecast
+  falls back to the old behaviour: the content of **modified tracked files** (and, with `--untracked`, of new
+  non-ignored files) is stored as unreferenced loose objects, never pushed, which `git gc` deletes only once they
+  are older than `gc.pruneExpire` (2 weeks by default). The temporary directory is under your OS temp folder, so
+  `--untracked` content briefly exists there; it is removed even on errors, but a hard kill
+  (`kill -9`) can leave a `ceasefire-q-*` folder behind.
 - There is **no size cap**: `--untracked` hashes every non-ignored new file, so keep build
   output, `node_modules` and secrets in `.gitignore`.
 - Clean filters run as for a normal `git add` — for example Git LFS will store LFS objects
-  under `.git/lfs` for changed LFS-tracked files.
+  under `.git/lfs` for changed LFS-tracked files. That is outside the object directory and is
+  **not** quarantined.
 - Inherited `GIT_DIR`, `GIT_INDEX_FILE` and similar variables are removed from every git
   call ceasefire makes, so running inside a git hook cannot redirect the snapshot.
+
+### Fast-forward pairs are skipped
+
+If one branch tip is an ancestor of (or equal to) another, merging them is a fast-forward and cannot
+conflict, so the all-pairs forecast leaves those pairs out. This is exact, not a heuristic: it comes from one
+`git rev-list --parents` over the tips, with a bitset per commit (equal tips are always skipped for free). The walk is only done when
+the number of pairs is large next to the size of the repository (roughly pairs ≥ objects/80), because on a
+100,000-commit history it costs about 0.8 s. It changes speed only; the test suite checks that results are identical
+with and without it.
 
 ## Benchmarks (re-runnable: `npm run bench`)
 
@@ -229,18 +266,33 @@ and then broke semantically
 ([source](https://github.com/jamescazzetta/moire), unverified by me): in real fleets the class is
 rare, and `--deep` is an opt-in extra, not the default.
 
-**Latency** (`bench/latency.mjs`, git 2.43, Node 22, 2 CPUs):
+**Latency** (`bench/latency.mjs`, git 2.43, Node 22, 2 CPUs, on a machine shared with other jobs: identical runs
+varied by +-30%, so read these as orders of magnitude). Every forecast timing is a **cold** run on a fresh
+repository, median of 3:
 
 | all-pairs forecast | 10 branches (45 pairs) | 20 (190) | 40 (780) |
 |---|---|---|---|
-| one git process per pair (0.2) | 194 ms | 811 ms | 3156 ms |
-| batched `merge-tree --stdin` (0.3) | 43 ms | 88 ms | 249 ms |
-| speed-up | 4.5x | 9.2x | 12.7x |
+| one git process per pair | 222 ms | 999 ms | 4203 ms |
+| batched `merge-tree --stdin` (0.3, writes nothing into the repo) | 52 ms | 196 ms | 805 ms |
+| speed-up | 4.3x | 5.1x | 5.2x |
+| `--deep` | 316 ms | 1013 ms | 3734 ms |
+| batched, merge results written into the repo (what 0.3 did before round 3) | 30 ms | 160 ms | 542 ms |
 
-Editor hook, whole process as Claude Code runs it (p50 / p95 of 25): node start-up alone 26/31 ms;
-check only 73/97 ms; with auto-lease 90/104 ms; with 200 intents in the ledger 92/107 ms.
+Correction to the first 0.3 numbers (43 / 88 / 249 ms, 4.5x / 9.2x / 12.7x): that benchmark repeated the same
+forecast on one repository, and git skips writing objects it already has, so every repeat was warm. Cold runs are
+what a real `conflicts` call sees. Keeping the repository clean costs a fixed ~20 ms of extra git processes (finding the object
+directory, resolving tips, deciding about the ancestry walk) and, at 40 branches, is within the noise of writing into the repo
+(a separate three-way comparison on fresh repositories gave 517-681 ms in the repo and 627-783 ms quarantined).
 
-Against Clash 0.2.0 (built from crates.io) on the same 10 worktrees with uncommitted edits (median
+Many stale branches (`bench/latency.mjs`, 300 branches that sit on `main` plus 20 diverged agent branches, 51,040 pairs):
+every pair 2233 ms, fast-forward pairs skipped 257 ms. One forecast of the 20 diverged branches added 400 loose objects
+to the repository before round 3 and adds 0 now. (Separately, by hand: `conflicts` on 600 branches that all point at one commit took 22.9 s
+and now takes about 0.2 s.)
+
+Editor hook, whole process as Claude Code runs it (p50 / p95 of 25): node start-up alone 28/34 ms;
+check only 75/90 ms; with auto-lease 86/101 ms; with 200 intents in the ledger 86/93 ms.
+
+Against Clash 0.2.0 (built from crates.io; measured in round 2, not re-run in round 3) on the same 10 worktrees with uncommitted edits (median
 of 7): `clash status --json` 54 ms vs `ceasefire conflicts --worktrees` 274 ms; `clash check` 29 ms vs
 `ceasefire hook` 86 ms. Clash is faster per call (native binary, no Node start-up); ceasefire's edge
 is what it can see, not raw speed.
@@ -267,8 +319,9 @@ the `CEASEFIRE_ALLOW_CONFLICT=1` override.
 
 ## How it compares
 
-Competitor statements come from each project's own README (linked). The only competitor I ran is
-Clash 0.2.0 (timings above); everything else is unverified by me.
+Competitor statements come from each project's own README (linked; Clash's and moire's READMEs were
+re-read on 2026-11-07, no new claims affected this table). The only competitor I ran is Clash 0.2.0 (timings
+above, measured in round 2; not re-run in round 3); everything else is unverified by me.
 
 | | ceasefire | [Clash](https://github.com/clash-sh/clash) | [moire](https://github.com/jamescazzetta/moire) | [AGNT-LOCK](https://github.com/codewithriza/AGNT-LOCK) | [agent-claim-mcp](https://github.com/vk0dev/agent-claim-mcp) | [mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail) |
 |---|---|---|---|---|---|---|
@@ -283,6 +336,8 @@ Clash 0.2.0 (timings above); everything else is unverified by me.
 | Zero-effort lease from the editor hook | yes (`--claim`, session-named, TTL) | no | no | no | no | no |
 | Lockfile/generated conflicts told apart | yes (marked regenerable + fix) | no | no | n/a | n/a | n/a |
 | Live view | `status [--oneline]` + status line | `watch` TUI | no | n/a | n/a | web UI |
+| Says which side should step aside | intent collisions: the earlier claim keeps the files (`yields`) | not documented | yes, a name-based tiebreak both sides compute | n/a | n/a | n/a |
+| Non-Claude agents | `check --claim`, `check --stdin`, MCP claim/release/status | JSON output, CLAUDE.md-style instructions | CLI | MCP | MCP | MCP |
 
 Worktree managers and session multiplexers
 ([Claude Squad](https://github.com/smtg-ai/claude-squad), [worktrunk](https://github.com/max-sixty/worktrunk),
@@ -300,7 +355,7 @@ a merge queue verifies the real merged result with your real CI.
 ## Layout (core)
 
 - `src/intent/` — SQLite intent store (TTL, upsert for remote intents)
-- `src/forecast/` — `git merge-tree` collision engine (batched), worktree snapshots, deep/semantic forecast, path canonicalization + globs
+- `src/forecast/` — `git merge-tree` collision engine (batched, object-quarantined, fast-forward pairs skipped in `ancestry.ts`), worktree snapshots, deep/semantic forecast, path canonicalization + globs
 - `bench/` — accuracy and latency benchmarks with committed results
 - `src/cli/` — commands, Claude Code hook, blocked-agent formatting, git-refs sync
 - `src/github/`, `src/mcp/`, `src/claimlock/` — Action, MCP server, claimlock adapter
@@ -312,7 +367,13 @@ Honest limits:
   semantic failure (a removed export that the other side's new code uses) for JavaScript/TypeScript
   and Python; it does not catch changed behaviour, changed signatures, duplicate symbols, or
   anything a compiler or test run would find. For those, run your real CI on the merged result.
-- The MCP server does not expose `--deep`, `--worktrees` or `status` yet.
+- The editor hook only sees the file-writing tools (Write, Edit, MultiEdit, NotebookEdit). Edits made by a
+  shell command (`sed -i`, a formatter, `git checkout`) are invisible to it; `--worktrees` still sees the result.
+  Codex-style `apply_patch` events are not parsed (their hook format was not verified); those agents use
+  `ceasefire check --claim` or the MCP tools.
+- A symlink is its own path: an edit through `link.ts` is not matched against a claim on its target.
+- Ancestry skipping adds one `git rev-list` pass; on very large histories it is skipped by a size heuristic
+  (it affects speed only). `--deep` still runs one `git merge-base` per non-related pair.
 - `--worktrees` compares worktrees of *one* clone; agents in separate clones or on
   other machines are covered by branches + the intent broadcast instead.
 - The workflow stub from `init` only forecasts the branches present in the CI checkout.
@@ -333,8 +394,13 @@ Ceasefire coordinates **trusted-but-uncoordinated** agents. Know the boundaries:
   hints and keep `CEASEFIRE_STRICT=1` decisions human-gated.
 - **Broadcast intents are validated, not trusted.** Anyone with push
   access can plant `refs/ceasefire/intents/*` refs. Fetched intents are
-  shape-checked, size-capped (64KB), count-capped (500), and ids must be
-  ref-safe — malformed or absurd ones are dropped, never imported.
+  shape-checked, size-capped (64KB), count-capped (500 kept, live and newest first, out of at most
+  5,000 refs inspected), and ids must be ref-safe — malformed or absurd ones are dropped, never imported.
+  An intent whose expiry is more than 7 days (plus a day of clock skew) away is dropped too, so a planted
+  claim cannot hold files, or under strict mode block edits, forever. A forged claim *within* those bounds
+  still holds its paths until it expires: treat strict mode as a gate you can lift (`CEASEFIRE_ALLOW_CONFLICT=1`).
+  Finished, long-expired, malformed and oversized refs are deleted (locally and on `origin`) at most once an hour, from
+  `start`, `done` and the session-end hook; before this, every `start` left a ref behind forever.
 - **`CEASEFIRE_ALLOW_CONFLICT=1` is a self-service override**, not a
   privilege escalation: it only affects the agent's own process, and every
   use is appended to `<store>/overrides.log` (JSONL) for audit.
@@ -349,7 +415,7 @@ Ceasefire coordinates **trusted-but-uncoordinated** agents. Know the boundaries:
 ## Dev
 
 ```sh
-npm test    # tsc + node:test, 221 tests (hermetic: ignores GITHUB_TOKEN, stays out of the parent repo)
+npm test    # tsc + node:test, 251 tests (hermetic: ignores GITHUB_TOKEN, stays out of the parent repo)
 npx tsc     # build -> dist/
-npm run bench   # accuracy + latency benchmarks (about 3 minutes)
+npm run bench   # accuracy (40 histories, as quoted above) + latency benchmarks (about 6 minutes)
 ```

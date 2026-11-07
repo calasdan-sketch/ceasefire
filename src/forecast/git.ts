@@ -101,9 +101,11 @@ export function beginObjectQuarantine(cwd: string): () => void {
     return () => undefined;
   }
   const inherited = process.env['GIT_ALTERNATE_OBJECT_DIRECTORIES'];
+  // A path that contains the list separator (a ':' on Linux) or a quote must be C-style quoted, or git splits it in two.
+  const entry = objects.includes(delimiter) || objects.includes('"') ? `"${objects.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : objects;
   quarantineEnv = {
     GIT_OBJECT_DIRECTORY: dir,
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: inherited ? `${objects}${delimiter}${inherited}` : objects,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: inherited ? `${entry}${delimiter}${inherited}` : entry,
   };
   return () => {
     quarantineEnv = null;

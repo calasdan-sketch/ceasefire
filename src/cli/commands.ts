@@ -139,7 +139,7 @@ export function usesDefaultIdentity(): boolean {
 /**
  * The agent's name: CEASEFIRE_AGENT, else `user@host`. The host part matters: every cloud
  * container and CI runner has the same user ("root", "runner"), and an agent never collides with
- * itself, so before 0.3.1 two such agents on different machines could never warn each other.
+ * itself, so before this change two such agents on different machines could never warn each other.
  */
 export function currentAgent(): string {
   const fromEnv = process.env.CEASEFIRE_AGENT?.trim();
@@ -418,8 +418,15 @@ function broadClaim(cwd: string, paths: string[]): { covered: number; total: num
   const files = listing.split('\0').filter(Boolean);
   if (files.length < BROAD_CLAIM_MIN_FILES) return null;
   const match = matchOptions(cwd, root);
-  let covered = 0;
-  for (const f of files) if (paths.some((p) => fileMatchesClaim(f, p, match))) covered++;
+  // Big monorepos: look at an even sample of at most 20,000 files and scale the count up.
+  const stride = Math.max(1, Math.ceil(files.length / 20_000));
+  let hit = 0;
+  let seen = 0;
+  for (let i = 0; i < files.length; i += stride) {
+    seen++;
+    if (paths.some((p) => fileMatchesClaim(files[i] as string, p, match))) hit++;
+  }
+  const covered = stride === 1 ? hit : Math.round((hit / seen) * files.length);
   return covered >= BROAD_CLAIM_MIN_FILES && covered / files.length >= BROAD_CLAIM_FRACTION ? { covered, total: files.length } : null;
 }
 
@@ -526,7 +533,10 @@ export function cmdDone(ctx: Ctx, id?: string, now: number = Date.now(), all = f
     // Import it locally first so the completion sticks and is re-broadcast.
     if (!store.get(target.id)) store.upsert(target);
     const updated = store.complete(target.id);
-    if (updated) broadcastIntent(ctx.cwd, updated); // best-effort, never throws
+    if (updated) {
+      broadcastIntent(ctx.cwd, updated); // best-effort, never throws
+      pruneIntentRefs(ctx.cwd);
+    }
     const line = `ceasefire: intent ${target.id.slice(0, 8)} ("${sanitizeDisplay(target.task)}") completed.`;
     return {
       exitCode: EXIT_CLEAR,
@@ -1130,7 +1140,13 @@ export function cmdDoctor(ctx: Ctx, now: number = Date.now()): CommandResult {
 
     const gitDir = tryGit(ctx.cwd, ['rev-parse', '--absolute-git-dir']);
     const pre = gitDir ? join(gitDir, 'hooks', 'pre-push') : '';
-    if (pre && existsSync(pre) && readFileSync(pre, 'utf8').includes(HOOK_MARKER)) add('pre-push hook', 'ok', 'installed (advisory)');
+    let preInstalled = false;
+    try {
+      preInstalled = pre !== '' && existsSync(pre) && readFileSync(pre, 'utf8').includes(HOOK_MARKER);
+    } catch {
+      /* unreadable hook: reported as not installed */
+    }
+    if (preInstalled) add('pre-push hook', 'ok', 'installed (advisory)');
     else add('pre-push hook', 'warn', 'not installed (run `ceasefire init`)');
 
     if (process.env.CEASEFIRE_SYNC === '0') add('cross-machine sync', 'warn', 'disabled by CEASEFIRE_SYNC=0');

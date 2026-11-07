@@ -40,20 +40,26 @@ function fleet(n, seed = 7) {
   return dir;
 }
 
+// Every timing is a COLD run: forecasts are quarantined (they leave nothing in the repository), so repeating one
+// does not get faster; the "in repo" column writes its merge results into the repository, so it is measured last,
+// once per repository. (Repeating it on one repository would let git skip writing objects it already has.)
 for (const n of [10, 20, 40]) {
-  const dir = fleet(n);
   const names = Array.from({ length: n }, (_, i) => `agent${i + 1}`);
   const pairs = (n * (n - 1)) / 2;
-  textualCollisions(dir, names); // warm file cache
-  const serial = [], batch = [], deep = [];
+  const serial = [], batch = [], deep = [], inRepo = [];
   for (let k = 0; k < 3; k++) {
+    const dir = fleet(n);
+    textualCollisions(dir, names); // warm the file cache (quarantined: leaves nothing behind)
     serial.push(time(() => textualCollisions(dir, names, undefined, { batch: false }))[0]);
     batch.push(time(() => textualCollisions(dir, names))[0]);
     const refs = names.map((nm) => ({ label: nm, oid: sh(dir, ['rev-parse', nm]) }));
     deep.push(time(() => deepForecast(dir, refs, { overlap: true, semantic: true }))[0]);
+    const oids = [...resolveCommits(dir, names).values()];
+    const plist = []; for (let i = 0; i < oids.length; i++) for (let j = i + 1; j < oids.length; j++) plist.push([oids[i], oids[j]]);
+    inRepo.push(time(() => mergeTreeBatch(dir, plist))[0]);
+    cleanup(dir);
   }
-  out.forecast.push({ branches: n, pairs, serial_ms: Math.round(median(serial)), batched_ms: Math.round(median(batch)), speedup: +(median(serial) / median(batch)).toFixed(1), deep_ms: Math.round(median(deep)) });
-  cleanup(dir);
+  out.forecast.push({ branches: n, pairs, serial_ms: Math.round(median(serial)), batched_ms: Math.round(median(batch)), speedup: +(median(serial) / median(batch)).toFixed(1), deep_ms: Math.round(median(deep)), in_repo_ms: Math.round(median(inRepo)) });
 }
 
 // repository with many stale branches (merged-but-not-deleted) plus 20 diverged agent branches,
@@ -127,9 +133,9 @@ for (const n of [10, 20, 40]) {
 if (JSON_OUT) console.log(JSON.stringify(out, null, 2));
 else {
   console.log(`git ${out.git.replace('git version ', '')}, ${out.node}, ${out.cpus} cpu(s)\n`);
-  console.log('all-pairs forecast (median of 3)');
-  console.log('branches  pairs   per-pair-git   batched   speedup   --deep');
-  for (const f of out.forecast) console.log(String(f.branches).padStart(8) + String(f.pairs).padStart(7) + (f.serial_ms + ' ms').padStart(14) + (f.batched_ms + ' ms').padStart(10) + (f.speedup + 'x').padStart(9) + (f.deep_ms + ' ms').padStart(9));
+  console.log('all-pairs forecast, cold runs (median of 3 fresh repositories)');
+  console.log('branches  pairs   per-pair-git   batched   speedup   --deep   batched, written into the repo (before round 3)');
+  for (const f of out.forecast) console.log(String(f.branches).padStart(8) + String(f.pairs).padStart(7) + (f.serial_ms + ' ms').padStart(14) + (f.batched_ms + ' ms').padStart(10) + (f.speedup + 'x').padStart(9) + (f.deep_ms + ' ms').padStart(9) + (f.in_repo_ms + ' ms').padStart(12));
   if (out.stale) console.log(`\nstale branches: ${out.stale.branches} branches (${out.stale.pairs} pairs), 20 of them diverged\n  every pair ${out.stale.all_pairs_ms} ms | fast-forward pairs skipped ${out.stale.skip_related_ms} ms\n  loose objects left in the repo by one forecast: ${out.stale.objects_written_now} now vs ${out.stale.objects_written_before} before (20 branches, merges written to the repo)`);
   console.log(`\neditor hook, whole process (${RUNS} runs)`);
   for (const h of out.hook) console.log('  ' + h.case.padEnd(40) + `p50 ${h.p50_ms} ms   p95 ${h.p95_ms} ms`);

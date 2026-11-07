@@ -1,6 +1,57 @@
 # Changelog
 
-## 0.3.0 — unreleased (expert round 2)
+## 0.3.0 — unreleased (expert rounds 2 and 3)
+
+### Round 3
+
+Panel: platform engineer (8 agents, large repo), attacker (planted refs, hostile names), git-internals/performance
+engineer, docs/DX lead (README only), competitor engineer (Clash, moire READMEs re-read 2026-11-07), Windows/CI
+release engineer, integrator for agents without the Claude hook. A second adversarial pass re-read the new diff and
+checked every README claim.
+
+#### Fixed
+- **Forecasts left junk in your repository.** `conflicts` wrote every merge result into the object store (about 7,300
+  loose objects / 30 MB for 81 branches, per run). Merge results and worktree snapshots now go to a temporary object
+  directory with the real store attached as an alternate; the directory is deleted when the command ends. (A repo path
+  containing the alternates separator, such as a `:` on Linux, is quoted; found in review, covered by a test.)
+- **Cross-machine broadcast silently stopped after 500 intents ever created.** The cap kept the first 500 ref
+  *names*, finished ones included, and nothing ever deleted a ref. Live and newest intents now come first, up to 5,000
+  refs are inspected, and finished (a day after finishing), long-expired, malformed and oversized refs are deleted
+  locally and on `origin`, at most hourly, from `start`, `done` and the session-end hook.
+- **A planted intent could hold files forever.** A remote intent expiring more than 7 days (+1 day of clock skew) ahead
+  is now dropped (the local maximum was always 7 days). Breaking: a forged far-future intent that used to be imported is
+  ignored.
+- **Two agents on different machines never warned each other** when both used the default name (`root`, `runner`, `ubuntu`).
+  The default is now `user@host`. Intents published under the old default name (`user`) cannot be completed by the new
+  name; they expire by themselves (default 4 h).
+- `conflicts | head` printed a stack trace (EPIPE); the MCP handshake always reported version 0.1.0; `check .git/config`
+  reported contention with a `**` claim; `check` outside a repository said "clear"; a detached HEAD was labelled "unknown"
+  (now `detached@<sha>`); `npm run bench` did not reproduce the committed accuracy table (12 vs 40 histories).
+- Test fixtures were never deleted (hundreds of directories in the temp folder after a few runs).
+- A README correction: the strict hook command written by `init --claude --strict` is `--strict --claim`; the first
+  0.3 latency table was measured on repeated (warm) runs, cold numbers are in the README now.
+
+#### Added
+- **Fast-forward pairs are skipped** in the all-pairs forecast (equal or ancestor tips cannot conflict). One
+  `git rev-list --parents` and a bitset per commit; used only when it pays (pairs >= objects/80). Branch tips are resolved
+  in one process. 600 identical branches: 22.9 s -> 0.2 s; 300 stale + 20 diverged: 2.2 s -> 0.26 s. Results identical (tests + accuracy benchmark).
+- `start` tells you which other intents already hold your paths and who claimed first (`contested` in JSON), warns
+  when a claim covers at least half of the tracked files, and when the agent name is only a guess.
+- Intent collisions carry `yields`: the side that should step aside (earlier claim wins, then lower id). The idea of a
+  tiebreak both sides compute is moire's; ceasefire's rule is the claim order.
+- `check --claim` (hold the files after a clear/advisory check) and `check --stdin` for agents without the Claude hook.
+- MCP: `ceasefire_claim`, `ceasefire_release`, `ceasefire_status`; `ceasefire_conflicts` accepts `deep` and `worktrees`.
+- `ceasefire doctor [--json]`.
+- Benchmark: cold-run methodology, stale-branch case, objects-written column.
+- 30 new tests (251 total).
+
+#### Not done / known limits
+- The editor hook cannot see edits made by shell commands; Codex `apply_patch` events are not parsed (hook format unverified).
+- Windows was exercised through path-fuzzing and the existing Windows-path tests only; no real Windows run.
+- Ancestry skipping adds a `rev-list` pass, skipped by a size heuristic on big histories (speed only).
+- `--deep` still runs one `merge-base` process per non-related pair; a batched implementation is not built.
+- Competitors were not re-installed or re-timed in this round.
+- The npm name `ceasefire` currently resolves to 0.0.1; 0.3 is not published.
 
 ### Fixed
 - **Worktrees did not share the ledger without a remote.** The intent store was

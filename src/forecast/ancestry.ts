@@ -12,18 +12,31 @@
  * If the history is too large to hold, or git fails, the answer is "no pair is related",
  * which only means no pair is skipped.
  */
-import { gitResult } from './git.js';
+import { gitResult, tryGit } from './git.js';
 
 /** Above this many reachable commits the bitsets could cost hundreds of MB: skip the optimisation. */
 export const MAX_ANCESTRY_COMMITS = 400_000;
 
 export type Related = (oidA: string, oidB: string) => boolean;
 
-const NOTHING_RELATED: Related = () => false;
+/**
+ * Walking history costs roughly one pair-merge per 16 commits, so on a big repository with few
+ * branches the walk would cost more than it saves. This decides only speed, never the answer.
+ */
+function worthWalking(cwd: string, distinctTips: number): boolean {
+  const pairs = (distinctTips * (distinctTips - 1)) / 2;
+  if (pairs < 60) return false; // a handful of merges is cheaper than another git process
+  const listing = tryGit(cwd, ['count-objects', '-v']);
+  if (!listing) return pairs >= 300;
+  const n = (key: string): number => Number(new RegExp(`^${key}: (\\d+)`, 'm').exec(listing)?.[1] ?? 0);
+  const objects = n('count') + n('in-pack');
+  return pairs >= objects / 80;
+}
 
-export function relatedTips(cwd: string, tips: string[]): Related {
+export function relatedTips(cwd: string, tips: string[], opts: { force?: boolean } = {}): Related {
   const distinct = [...new Set(tips)];
   if (distinct.length < 2) return (a, b) => a === b;
+  if (!opts.force && !worthWalking(cwd, distinct.length)) return (a, b) => a === b;
   const index = new Map(distinct.map((o, i) => [o, i]));
   const r = gitResult(cwd, ['rev-list', '--parents', '--topo-order', '--stdin'], { input: distinct.join('\n') + '\n' });
   if (r.exitCode !== 0) return (a, b) => a === b;
@@ -54,4 +67,3 @@ export function relatedTips(cwd: string, tips: string[]): Related {
   return (a, b) => a === b || has(a, b) || has(b, a);
 }
 
-export { NOTHING_RELATED };

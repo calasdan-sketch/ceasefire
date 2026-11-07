@@ -1,16 +1,19 @@
 git 2.43.0, v22.23.4, 2 cpu(s)
 
-all-pairs forecast (median of 3)
-branches  pairs   per-pair-git   batched   speedup   --deep
-      10     45        194 ms     43 ms     4.5x   317 ms
-      20    190        811 ms     88 ms     9.2x   972 ms
-      40    780       3156 ms    249 ms    12.7x  3643 ms
+all-pairs forecast, cold runs (median of 3 fresh repositories)
+branches  pairs   per-pair-git   batched   speedup   --deep   batched, written into the repo (before round 3)
+      10     45        222 ms     52 ms     4.3x   316 ms       30 ms
+      20    190        999 ms    196 ms     5.1x  1013 ms      160 ms
+      40    780       4203 ms    805 ms     5.2x  3734 ms      542 ms
+
+stale branches: 320 branches (51040 pairs), 20 of them diverged
+  every pair 2233 ms | fast-forward pairs skipped 257 ms
+  loose objects left in the repo by one forecast: 0 now vs 400 before (20 branches, merges written to the repo)
 
 editor hook, whole process (25 runs)
-  node start-up alone (floor)             p50 26 ms   p95 31 ms
-  hook, check only                        p50 73 ms   p95 97 ms
-  hook --claim (check + auto-lease)       p50 90 ms   p95 104 ms
-  hook --claim, 200 intents in ledger     p50 92 ms   p95 107 ms
+  node start-up alone (floor)             p50 28 ms   p95 34 ms
+  hook, check only                        p50 75 ms   p95 90 ms
+  hook --claim (check + auto-lease)       p50 86 ms   p95 101 ms
+  hook --claim, 200 intents in ledger     p50 86 ms   p95 93 ms
 
-vs Clash clash 0.2.0 on 10 worktrees with uncommitted edits (median of 7):
-  clash status --json 54 ms | ceasefire conflicts --worktrees 274 ms | clash check 29 ms | ceasefire hook 86 ms
+(Clash not found: set CLASH_BIN to include it)
