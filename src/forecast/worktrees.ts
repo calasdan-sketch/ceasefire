@@ -26,7 +26,7 @@ import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, gitResult, CeasefireGitError } from './git.js';
-import { gitSupportsWriteTree, mergeTreeConflictedFiles } from './forecast.js';
+import { gitSupportsWriteTree, mergeTreeConflictedFilesMany } from './forecast.js';
 import type { Collision } from '../types.js';
 
 export interface WorktreeInfo {
@@ -166,29 +166,34 @@ export function forecastWorktrees(cwd: string, opts: { includeUntracked?: boolea
     }
   }
   const collisions: Collision[] = [];
+  const jobs: Array<{ a: WorktreeSnapshot; b: WorktreeSnapshot }> = [];
   for (let i = 0; i < snapshots.length; i++) {
     for (let j = i + 1; j < snapshots.length; j++) {
       const a = snapshots[i] as WorktreeSnapshot;
       const b = snapshots[j] as WorktreeSnapshot;
-      if (a.snapshot === b.snapshot) continue;
-      let files: string[];
-      try {
-        files = mergeTreeConflictedFiles(cwd, a.snapshot, b.snapshot);
-      } catch (e) {
-        skipped.push({ worktree: `${a.path} <-> ${b.path}`, reason: e instanceof Error ? e.message : String(e) });
-        continue;
-      }
-      if (files.length > 0) {
-        const state = (s: WorktreeSnapshot): string => (s.dirty ? 'uncommitted changes' : 'committed only');
-        collisions.push({
-          prA: `${a.label} [worktree]`,
-          prB: `${b.label} [worktree]`,
-          files,
-          severity: 'textual',
-          detail: `${a.label}: ${state(a)}; ${b.label}: ${state(b)}`,
-        });
-      }
+      if (a.snapshot !== b.snapshot) jobs.push({ a, b });
     }
   }
+  const results = mergeTreeConflictedFilesMany(
+    cwd,
+    jobs.map((p) => [p.a.snapshot, p.b.snapshot] as [string, string]),
+  );
+  jobs.forEach(({ a, b }, k) => {
+    const r = results[k] as { files: string[] } | { error: Error };
+    if ('error' in r) {
+      skipped.push({ worktree: `${a.path} <-> ${b.path}`, reason: r.error.message });
+      return;
+    }
+    if (r.files.length > 0) {
+      const state = (s: WorktreeSnapshot): string => (s.dirty ? 'uncommitted changes' : 'committed only');
+      collisions.push({
+        prA: `${a.label} [worktree]`,
+        prB: `${b.label} [worktree]`,
+        files: r.files,
+        severity: 'textual',
+        detail: `${a.label}: ${state(a)}; ${b.label}: ${state(b)}`,
+      });
+    }
+  });
   return { worktrees: snapshots, collisions, skipped };
 }

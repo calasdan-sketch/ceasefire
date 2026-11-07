@@ -28,13 +28,14 @@ export function deriveVerdict(collisions: Collision[]): Verdict {
   return collisions.some((c) => c.severity === 'textual') ? 'blocked' : 'advisory';
 }
 
-const SEVERITY_RANK: Record<CollisionSeverity, number> = { textual: 0, intent: 1, semantic: 2 };
+const SEVERITY_RANK: Record<CollisionSeverity, number> = { textual: 0, intent: 1, semantic: 2, overlap: 3 };
 
 function severityLabel(s: CollisionSeverity): string {
   switch (s) {
     case 'textual': return '🔴 Textual';
     case 'intent': return '🟡 Intent';
     case 'semantic': return '🟣 Semantic';
+    case 'overlap': return '🟠 Overlap';
   }
 }
 
@@ -86,6 +87,10 @@ const EXPLAINERS: Record<CollisionSeverity, { what: string; next: string }> = {
   semantic: {
     what: 'No textual conflict, but the changes may **interact** — duplicate symbols, conflicting imports, or behavior changes the other branch depends on.',
     next: 'Review both diffs together. Consider merging one first, then re-running CI on the other before it lands.',
+  },
+  overlap: {
+    what: 'Both branches changed the **same file**. Git merges it cleanly, but the edits were made without seeing each other.',
+    next: 'Skim both diffs of these files before merging the second branch.',
   },
 };
 

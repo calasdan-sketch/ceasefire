@@ -20,7 +20,7 @@
 import { isAbsolute, dirname } from 'node:path';
 import { statSync } from 'node:fs';
 import { findGitRoot } from '../forecast/git.js';
-import { cmdCheck, type CommandResult } from './commands.js';
+import { cmdCheck, claimLease, releaseLeases, type CommandResult } from './commands.js';
 import { enableFetchCaching } from './sync.js';
 import { EXIT_CLEAR, EXIT_ERROR, EXIT_ADVISORY, EXIT_BLOCKED } from '../types.js';
 
@@ -39,6 +39,12 @@ export interface HookOptions {
   ask: boolean;
   /** Same as CEASEFIRE_STRICT=1: deny on collision, fail closed on any failure. */
   strict?: boolean;
+  /**
+   * Maintain an implicit sliding-TTL lease on every file this session edits
+   * (also CEASEFIRE_CLAIM=1): no `ceasefire start` needed, and a session that
+   * dies releases its files by itself after CEASEFIRE_LEASE_TTL (default 15m).
+   */
+  claim?: boolean;
   /** True when stdin exceeded MAX_HOOK_INPUT_BYTES and was truncated. */
   overflow?: boolean;
 }
@@ -81,6 +87,35 @@ function nearestRepoDir(file: string): string | null {
   return null;
 }
 
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+/**
+ * Two Claude Code sessions run by one OS user used to share one agent name
+ * (the username), and a session never collides with itself, so they could not
+ * warn each other. With no explicit CEASEFIRE_AGENT, the hook names the agent
+ * after the event's session id instead. An explicit CEASEFIRE_AGENT always wins.
+ */
+function adoptSessionIdentity(e: Record<string, unknown>): void {
+  if (process.env.CEASEFIRE_AGENT?.trim()) return;
+  const sid = e['session_id'];
+  if (typeof sid === 'string' && SESSION_ID_RE.test(sid)) process.env.CEASEFIRE_AGENT = `claude-${sid.replace(/[^A-Za-z0-9]/g, '').slice(0, 12)}`;
+}
+
+/** SessionEnd hook: release this session's auto-leases right away instead of waiting for the TTL. */
+export function runReleaseHook(input: string): CommandResult {
+  try {
+    const e = JSON.parse(input) as unknown;
+    if (typeof e !== 'object' || e === null) return { exitCode: EXIT_CLEAR, stdout: '' };
+    const rec = e as Record<string, unknown>;
+    adoptSessionIdentity(rec);
+    const cwd = typeof rec['cwd'] === 'string' && isAbsolute(rec['cwd']) ? rec['cwd'] : process.cwd();
+    if (findGitRoot(cwd)) releaseLeases({ cwd, json: true });
+  } catch {
+    /* releasing is best-effort; the TTL is the backstop */
+  }
+  return { exitCode: EXIT_CLEAR, stdout: '' };
+}
+
 /** Handle one Claude Code PreToolUse event (raw stdin text). */
 export function runClaudeHook(input: string, opts: HookOptions): CommandResult {
   if (opts.strict) process.env.CEASEFIRE_STRICT = '1';
@@ -94,6 +129,7 @@ export function runClaudeHook(input: string, opts: HookOptions): CommandResult {
   }
   if (typeof event !== 'object' || event === null) return failure('stdin was not a JSON object');
   const e = event as Record<string, unknown>;
+  adoptSessionIdentity(e);
   const toolName = typeof e['tool_name'] === 'string' ? e['tool_name'] : '';
   const field = FILE_TOOLS[toolName];
   if (!field) return { exitCode: EXIT_CLEAR, stdout: '' }; // not a file write: no opinion
@@ -112,6 +148,15 @@ export function runClaudeHook(input: string, opts: HookOptions): CommandResult {
     result = cmdCheck({ cwd, json: true, outsideRepo: 'ignore' }, [filePath]);
   } catch (err) {
     return failure(err instanceof Error ? err.message : String(err));
+  }
+  const claim = opts.claim === true || process.env.CEASEFIRE_CLAIM === '1';
+  if (claim && result.exitCode !== EXIT_BLOCKED && (result.exitCode === EXIT_CLEAR || result.exitCode === EXIT_ADVISORY)) {
+    try {
+      const files = (JSON.parse(result.stdout) as { files?: unknown }).files;
+      if (Array.isArray(files)) claimLease({ cwd, json: true }, files.filter((f): f is string => typeof f === 'string'));
+    } catch {
+      /* a check result we cannot read is handled below */
+    }
   }
   if (result.exitCode === EXIT_CLEAR) return { exitCode: EXIT_CLEAR, stdout: '' };
   if (result.exitCode !== EXIT_ADVISORY && result.exitCode !== EXIT_BLOCKED) {

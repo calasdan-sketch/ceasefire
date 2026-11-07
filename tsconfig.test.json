@@ -25,6 +25,7 @@
     "test/paths.test.ts",
     "test/worktrees.test.ts",
     "test/hook.test.ts",
-    "test/review.test.ts"
+    "test/review.test.ts",
+    "test/expert2.test.ts"
   ]
 }

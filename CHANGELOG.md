@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.0 — unreleased (expert round 2)
+
+### Fixed
+- **Worktrees did not share the ledger without a remote.** The intent store was
+  `<worktree>/.ceasefire`, so an agent in one `git worktree` never saw intents from another unless
+  a remote relayed them. It now lives in `<git common dir>/ceasefire` (shared by every worktree of
+  a clone, and inside `.git`, so it cannot be committed or snapshotted). Old `.ceasefire/` folders
+  are not migrated.
+- **Two Claude Code sessions of one OS user could never warn each other** (same default agent name,
+  and an agent never collides with itself). The hook now names the agent `claude-<session id>`
+  unless `CEASEFIRE_AGENT` is set.
+
+### Added
+- `conflicts --deep` / `--overlap` / `--semantic` / `--neighbors`: removed-export-still-used
+  detection (JS/TS, Python; `severity: "semantic"`, `confidence: "high"`), same-file races
+  (`severity: "overlap"`), import-graph neighbors (low confidence). Works on branches and on
+  `--worktrees` snapshots. Collisions gain optional `confidence`, `regenerable`, `hint` fields.
+- Lockfile/generated-file conflicts are marked `regenerable` with the command to run;
+  `--exit-code --ignore-regenerable` lets CI skip them.
+- `hook claude --claim` auto-lease (sliding TTL, `CEASEFIRE_LEASE_TTL`), `hook release` for
+  `SessionEnd`, `done --all`. `init --claude` now installs both hooks (`--claim` is on for new
+  installs; existing installs gain the SessionEnd hook on re-run) and `--statusline` fills an empty
+  `statusLine` slot.
+- `status [--oneline] [--json]`: who is editing what, from the local ledger, no network.
+- `bench/accuracy.mjs` and `bench/latency.mjs` with committed results in `bench/results/`.
+
+### Changed
+- All-pairs forecasts use one batched `git merge-tree --stdin` process per 256 pairs (git >= 2.40;
+  older gits and any pair the batch cannot answer fall back to one merge per pair): 4.5x / 9.2x /
+  12.7x faster for 10 / 20 / 40 branches. Output is identical (checked in the tests and the
+  benchmark).
+- 33 new tests (221 total). Two existing tests now expect `--claim` in the installed hook command.
+
 ## 0.2.0 — unreleased
 
 ### Fixed after the independent panel review

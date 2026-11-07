@@ -11,6 +11,9 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Intent } from '../types.js';
 
+/** Task text of the implicit, sliding-TTL lease the editor hook maintains per agent. */
+export const AUTO_LEASE_TASK = 'editing (auto-lease)';
+
 /** Default intent TTL: 4 hours. */
 export const DEFAULT_TTL_MS = 4 * 60 * 60 * 1000;
 
@@ -158,6 +161,76 @@ export class IntentStore {
       | IntentRow
       | undefined;
     return row ? rowToIntent(row) : null;
+  }
+
+  /**
+   * Refresh the agent's implicit "lease" on a file (sliding TTL).
+   *
+   * An auto-lease is a normal intent whose task is AUTO_LEASE_TASK: one per
+   * (agent, branch). Each edit adds the file to its paths and pushes the
+   * expiry out by `ttlMs`, so a crashed or abandoned session stops holding
+   * files `ttlMs` after its last edit with no cleanup step. The read-modify-
+   * write runs in one IMMEDIATE transaction, so two edits racing from one
+   * agent cannot lose a path.
+   */
+  touchLease(
+    path: string,
+    opts: { agent: string; branch: string; ttlMs: number; now?: number; maxPaths?: number },
+  ): { intent: Intent; created: boolean; pathAdded: boolean } {
+    if (!opts.agent.trim()) throw new Error('ceasefire: agent identity must be a non-empty string');
+    if (!Number.isFinite(opts.ttlMs) || opts.ttlMs <= 0) throw new Error('ceasefire: lease ttl must be positive');
+    const now = opts.now ?? Date.now();
+    const maxPaths = opts.maxPaths ?? 200;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db
+        .prepare(
+          "SELECT * FROM intents WHERE status = 'active' AND expires_at > ? AND agent = ? AND branch = ? AND task = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .get(now, opts.agent, opts.branch, AUTO_LEASE_TASK) as unknown as IntentRow | undefined;
+      let result: { intent: Intent; created: boolean; pathAdded: boolean };
+      if (row) {
+        const intent = rowToIntent(row);
+        const has = intent.paths.includes(path);
+        const paths = has ? intent.paths : [...intent.paths, path].slice(-maxPaths);
+        const expiresAt = Math.max(intent.expiresAt, now + opts.ttlMs);
+        this.db.prepare('UPDATE intents SET paths = ?, expires_at = ? WHERE id = ?').run(JSON.stringify(paths), expiresAt, intent.id);
+        result = { intent: { ...intent, paths, expiresAt }, created: false, pathAdded: !has };
+      } else {
+        const intent: Intent = {
+          id: randomUUID(),
+          agent: opts.agent,
+          task: AUTO_LEASE_TASK,
+          branch: opts.branch,
+          paths: [path],
+          createdAt: now,
+          expiresAt: now + opts.ttlMs,
+          status: 'active',
+        };
+        this.db
+          .prepare('INSERT INTO intents (id, agent, task, branch, paths, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(intent.id, intent.agent, intent.task, intent.branch, JSON.stringify(intent.paths), intent.createdAt, intent.expiresAt, intent.status);
+        result = { intent, created: true, pathAdded: true };
+      }
+      this.db.exec('COMMIT');
+      return result;
+    } catch (e) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* no transaction left to roll back */
+      }
+      throw e;
+    }
+  }
+
+  /** Complete every active intent of `agent` (optionally only auto-leases). Returns the completed intents. */
+  completeAll(agent: string, opts: { onlyLeases?: boolean; now?: number } = {}): Intent[] {
+    const mine = this.list({ agent, status: 'active', ...(opts.now !== undefined ? { now: opts.now } : {}) }).filter(
+      (i) => !opts.onlyLeases || i.task === AUTO_LEASE_TASK,
+    );
+    for (const i of mine) this.db.prepare("UPDATE intents SET status = 'done' WHERE id = ?").run(i.id);
+    return mine.map((i) => ({ ...i, status: 'done' as const }));
   }
 
   /** Mark an intent done. Returns the updated intent, or null if unknown. */

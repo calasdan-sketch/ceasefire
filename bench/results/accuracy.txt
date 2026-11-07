@@ -1,0 +1,10 @@
+accuracy: 40 histories x 6 agents, 10 modules, seed 1 -> 600 agent pairs
+ground truth (real git merge + real node link check): TEXTUAL 65, BREAKS-despite-clean-merge 16, OK 519
+batch merge-tree == per-pair merge-tree in 40/40 histories; 1/65 textual collisions are lockfile-only (regenerable)
+
+detector                          flagged  precision  recall  recall(breaks)  false-alarms
+merge-tree only (ceasefire 0.2)        65     100.0%   80.2%           0.0%             0
++ overlap (--overlap)                 234      29.5%   85.2%          25.0%           165
++ semantic (--semantic)                81     100.0%  100.0%         100.0%             0
+--deep (overlap+semantic)             246      32.9%  100.0%         100.0%           165
+--deep --neighbors                    465      17.4%  100.0%         100.0%           384

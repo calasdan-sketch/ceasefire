@@ -4,8 +4,8 @@
  * warning never pollutes agent-facing output.
  */
 import { readFileSync } from 'node:fs';
-import { cmdCheck, cmdConflicts, cmdDone, cmdInit, cmdList, cmdStart, cmdSuggest, parseTtl, type Ctx } from './commands.js';
-import { runClaudeHook, MAX_HOOK_INPUT_BYTES } from './hook.js';
+import { cmdCheck, cmdConflicts, cmdDone, cmdInit, cmdList, cmdStart, cmdStatus, cmdSuggest, parseTtl, type Ctx } from './commands.js';
+import { runClaudeHook, runReleaseHook, MAX_HOOK_INPUT_BYTES } from './hook.js';
 import { EXIT_ERROR } from '../types.js';
 
 function version(): string {
@@ -37,6 +37,15 @@ interface Parsed {
   ask: boolean;
   claude: boolean;
   strict: boolean;
+  deep: boolean;
+  overlap: boolean;
+  semantic: boolean;
+  neighbors: boolean;
+  ignoreRegenerable: boolean;
+  claim: boolean;
+  all: boolean;
+  oneline: boolean;
+  statusline: boolean;
 }
 
 function parseArgs(argv: string[]): Parsed {
@@ -53,6 +62,15 @@ function parseArgs(argv: string[]): Parsed {
     ask: false,
     claude: false,
     strict: false,
+    deep: false,
+    overlap: false,
+    semantic: false,
+    neighbors: false,
+    ignoreRegenerable: false,
+    claim: false,
+    all: false,
+    oneline: false,
+    statusline: false,
   };
   let i = 0;
   while (i < argv.length) {
@@ -79,6 +97,15 @@ function parseArgs(argv: string[]): Parsed {
       else if (name === 'ask') out.ask = true;
       else if (name === 'claude') out.claude = true;
       else if (name === 'strict') out.strict = true;
+      else if (name === 'deep') out.deep = true;
+      else if (name === 'claim') out.claim = true;
+      else if (name === 'all') out.all = true;
+      else if (name === 'oneline') out.oneline = true;
+      else if (name === 'statusline') out.statusline = true;
+      else if (name === 'overlap') out.overlap = true;
+      else if (name === 'semantic') out.semantic = true;
+      else if (name === 'neighbors') out.neighbors = true;
+      else if (name === 'ignore-regenerable') out.ignoreRegenerable = true;
       else if (name === 'ttl') {
         i++;
         if (i >= argv.length) throw new Error('ceasefire: --ttl needs a value, e.g. --ttl 30m');
@@ -111,19 +138,28 @@ function parseArgs(argv: string[]): Parsed {
 const HELP = `ceasefire ${VERSION} — parallel agents, zero merge fights.
 
 Usage:
-  ceasefire init [--claude [--strict]]    install pre-push hook + GitHub workflow stub
-                                          (--claude: also add a Claude Code PreToolUse hook;
-                                           --strict: hook denies collisions, onFailure "block")
+  ceasefire init [--claude [--strict] [--statusline]]
+                                          install pre-push hook + GitHub workflow stub
+                                          (--claude: also add the Claude Code hooks with auto-lease;
+                                           --strict: hook denies collisions, onFailure "block";
+                                           --statusline: show "ceasefire status --oneline" in Claude Code)
   ceasefire check <files...> [--json]     pre-edit collision check (paths may be absolute)
   ceasefire start "<task>" --paths <...>  publish an intent (advisory; paths or globs like 'src/**/*.ts')
         [--ttl 30m|2h|1d]                 intent lifetime (default 4h, 1m..7d)
-  ceasefire done [--id <id>]              complete your active intent
+  ceasefire done [--id <id> | --all]      complete your active intent (or all of them)
+  ceasefire status [--oneline] [--json]   who is editing what right now (no network); --oneline fits a status line
   ceasefire list [--json]                 active intents, yours and other agents'
   ceasefire conflicts [--json]            collision matrix across branches + intents
         [--worktrees [--untracked]]       compare git worktrees incl. uncommitted edits
-        [--exit-code]                     exit 2 when any collision is found
+        [--deep]                          also find what merge-tree cannot: removed exports still used
+                                          by the other branch (semantic) + same-file races (overlap)
+        [--overlap|--semantic|--neighbors] pick individual deep checks (--neighbors = import-graph, noisy)
+        [--exit-code [--ignore-regenerable]] exit 2 on any collision (lockfile-only ones optional)
   ceasefire suggest [files...] [--json]   unclaimed files to work on instead
-  ceasefire hook claude [--ask|--strict]  Claude Code PreToolUse hook (reads the event on stdin)
+  ceasefire hook claude [--ask|--strict] [--claim]
+                                          Claude Code PreToolUse hook (reads the event on stdin);
+                                          --claim keeps a 15-minute sliding lease on every file the session edits
+  ceasefire hook release                  Claude Code SessionEnd hook: free this session's leases
   ceasefire --mcp                         start MCP stdio server (ceasefire_check, ceasefire_conflicts)
 
 Exit codes: 0 clear · 1 error · 2 advisory · 3 hard block (CEASEFIRE_STRICT=1)
@@ -169,7 +205,8 @@ async function main(): Promise<void> {
     case 'init': {
       if (parsed.positionals.length > 0) fail('usage: ceasefire init [--claude]');
       if (parsed.strict && !parsed.claude) fail('--strict only applies to `ceasefire init --claude`');
-      return emit(cmdInit(ctx, { claude: parsed.claude, strict: parsed.strict }));
+      if (parsed.statusline && !parsed.claude) fail('--statusline only applies to `ceasefire init --claude`');
+      return emit(cmdInit(ctx, { claude: parsed.claude, strict: parsed.strict, statusline: parsed.statusline }));
     }
     case 'check': {
       return emit(cmdCheck(ctx, parsed.positionals));
@@ -187,12 +224,20 @@ async function main(): Promise<void> {
     }
     case 'done': {
       if (parsed.positionals.length > 0) fail('usage: ceasefire done [--id <id>]');
-      return emit(cmdDone(ctx, parsed.id));
+      return emit(cmdDone(ctx, parsed.id, Date.now(), parsed.all));
     }
     case 'conflicts': {
       if (parsed.positionals.length > 0) fail('usage: ceasefire conflicts [--json] [--worktrees [--untracked]] [--exit-code]');
       return emit(
-        cmdConflicts(ctx, Date.now(), { exitCode: parsed.exitCode, worktrees: parsed.worktrees, untracked: parsed.untracked }),
+        cmdConflicts(ctx, Date.now(), {
+          exitCode: parsed.exitCode,
+          worktrees: parsed.worktrees,
+          untracked: parsed.untracked,
+          overlap: parsed.deep || parsed.overlap,
+          semantic: parsed.deep || parsed.semantic,
+          neighbors: parsed.neighbors,
+          ignoreRegenerable: parsed.ignoreRegenerable,
+        }),
       );
     }
     case 'list': {
@@ -200,10 +245,16 @@ async function main(): Promise<void> {
       return emit(cmdList(ctx));
     }
     case 'hook': {
-      if (parsed.positionals.length !== 1 || parsed.positionals[0] !== 'claude') fail('usage: ceasefire hook claude [--ask|--strict]');
-      if (process.stdin.isTTY) fail('`ceasefire hook claude` reads a Claude Code hook event on stdin; it is meant to be run by Claude Code (see `ceasefire init --claude`).');
+      const which = parsed.positionals[0];
+      if (parsed.positionals.length !== 1 || (which !== 'claude' && which !== 'release')) fail('usage: ceasefire hook claude [--ask|--strict|--claim] | ceasefire hook release');
+      if (process.stdin.isTTY) fail(`\`ceasefire hook ${which}\` reads a Claude Code hook event on stdin; it is meant to be run by Claude Code (see \`ceasefire init --claude\`).`);
       const input = await readStdin(MAX_HOOK_INPUT_BYTES);
-      return emit(runClaudeHook(input.text, { ask: parsed.ask, strict: parsed.strict, overflow: input.overflow }));
+      if (which === 'release') return emit(runReleaseHook(input.text));
+      return emit(runClaudeHook(input.text, { ask: parsed.ask, strict: parsed.strict, claim: parsed.claim, overflow: input.overflow }));
+    }
+    case 'status': {
+      if (parsed.positionals.length > 0) fail('usage: ceasefire status [--oneline] [--json]');
+      return emit(cmdStatus(ctx, { oneline: parsed.oneline }));
     }
     case 'suggest': {
       return emit(cmdSuggest(ctx, parsed.positionals));

@@ -3,16 +3,19 @@
  *
  * Resolution order:
  *   1. CEASEFIRE_DIR env var (explicit override, used by tests and CI)
- *   2. <git-root>/.ceasefire when inside a git repo (repo-local, shared by
- *      every agent working in that checkout)
+ *   2. <git-common-dir>/ceasefire when inside a git repo. The common dir is
+ *      shared by the main checkout AND every `git worktree` of it, so agents
+ *      in separate worktrees see each other's intents with no remote at all
+ *      (0.2 used <worktree>/.ceasefire, which silently split the ledger per
+ *      worktree). Living inside .git, it can never be committed or snapshotted.
  *   3. ~/.ceasefire (fallback outside any repo)
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { renameSync, existsSync, statSync } from 'node:fs';
-import { findGitRoot } from '../forecast/git.js';
+import { findGitRoot, tryGit } from '../forecast/git.js';
 
-export { IntentStore, DEFAULT_TTL_MS } from './store.js';
+export { IntentStore, DEFAULT_TTL_MS, AUTO_LEASE_TASK } from './store.js';
 export type { PublishOptions, ListOptions } from './store.js';
 import { IntentStore } from './store.js';
 
@@ -20,7 +23,11 @@ export function resolveStoreDir(cwd: string = process.cwd()): string {
   const envDir = process.env.CEASEFIRE_DIR;
   if (envDir && envDir.trim()) return envDir;
   const root = findGitRoot(cwd);
-  if (root) return join(root, '.ceasefire');
+  if (root) {
+    const common = tryGit(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+    if (common) return join(common, 'ceasefire');
+    return join(root, '.ceasefire');
+  }
   return join(homedir(), '.ceasefire');
 }
 

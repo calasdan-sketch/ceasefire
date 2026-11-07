@@ -24,6 +24,7 @@
  * agents whose claimed paths overlap (exact match or directory prefix).
  */
 import { git, gitResult, mergeBase, CeasefireGitError } from './git.js';
+import { mergeTreeBatch, gitSupportsMergeTreeStdin } from './batch.js';
 export { mergeBase } from './git.js';
 import type { Collision, Intent } from '../types.js';
 
@@ -31,6 +32,18 @@ import type { Collision, Intent } from '../types.js';
 const WRITE_TREE_MIN = { major: 2, minor: 38 };
 
 let writeTreeSupport: boolean | null = null;
+let stdinSupport: boolean | null = null;
+
+/** True when `git merge-tree --stdin` (git >= 2.40) is available. Cached. */
+export function gitSupportsMergeTreeStdinCached(cwd: string): boolean {
+  if (stdinSupport !== null) return stdinSupport;
+  try {
+    stdinSupport = gitSupportsMergeTreeStdin(git(cwd, ['--version']));
+  } catch {
+    stdinSupport = false;
+  }
+  return stdinSupport;
+}
 
 /** True when the local git understands `merge-tree --write-tree`. Cached. */
 export function gitSupportsWriteTree(cwd: string): boolean {
@@ -51,6 +64,7 @@ export function gitSupportsWriteTree(cwd: string): boolean {
 /** Reset the cached capability probe. Exported for tests. */
 export function resetGitCapabilityCache(): void {
   writeTreeSupport = null;
+  stdinSupport = null;
 }
 
 /**
@@ -156,6 +170,32 @@ export function mergeTreeConflictedFilesLegacy(
 }
 
 /**
+ * Conflicted files for many commit pairs. Uses one batched git process per
+ * 256 pairs when git supports `merge-tree --stdin`, and one merge per pair
+ * otherwise or for any pair the batch could not answer. Each entry is the
+ * file list or the Error that made that pair unforecastable.
+ */
+export function mergeTreeConflictedFilesMany(
+  cwd: string,
+  pairs: Array<[string, string]>,
+  opts: { batch?: boolean } = {},
+): Array<{ files: string[] } | { error: Error }> {
+  const batched: Array<string[] | null> =
+    (opts.batch ?? true) && gitSupportsWriteTree(cwd) && gitSupportsMergeTreeStdinCached(cwd)
+      ? mergeTreeBatch(cwd, pairs)
+      : pairs.map(() => null);
+  return pairs.map(([a, b], i) => {
+    const got = batched[i];
+    if (got) return { files: got };
+    try {
+      return { files: mergeTreeConflictedFiles(cwd, a, b) };
+    } catch (e) {
+      return { error: e instanceof Error ? e : new Error(String(e)) };
+    }
+  });
+}
+
+/**
  * Pairwise textual collisions across branches. Each unordered pair is
  * checked once; a branch is never compared against itself.
  *
@@ -167,25 +207,40 @@ export function textualCollisions(
   cwd: string,
   branches: string[],
   onSkip?: (a: string, b: string, reason: string) => void,
+  opts: { batch?: boolean } = {},
 ): Collision[] {
-  const collisions: Collision[] = [];
   const unique = [...new Set(branches)];
+  // Resolve every branch to a commit id once (N cheap calls) so the N^2 merges can
+  // travel on one stdin stream. An unreadable ref only skips the pairs it is in.
+  const oids = new Map<string, string>();
+  const bad = new Map<string, string>();
+  for (const b of unique) {
+    const r = gitResult(cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${b}^{commit}`]);
+    const oid = r.stdout.trim();
+    if (r.exitCode === 0 && /^[0-9a-f]{40,64}$/.test(oid)) oids.set(b, oid);
+    else bad.set(b, r.stderr.trim() || `cannot resolve "${b}" to a commit`);
+  }
+  const jobs: Array<{ a: string; b: string }> = [];
   for (let i = 0; i < unique.length; i++) {
     for (let j = i + 1; j < unique.length; j++) {
       const a = unique[i] as string;
       const b = unique[j] as string;
-      let files: string[];
-      try {
-        files = mergeTreeConflictedFiles(cwd, a, b);
-      } catch (e) {
-        onSkip?.(a, b, e instanceof Error ? e.message : String(e));
-        continue;
-      }
-      if (files.length > 0) {
-        collisions.push({ prA: a, prB: b, files, severity: 'textual' });
-      }
+      const why = bad.get(a) ?? bad.get(b);
+      if (why !== undefined) onSkip?.(a, b, why);
+      else jobs.push({ a, b });
     }
   }
+  const results = mergeTreeConflictedFilesMany(
+    cwd,
+    jobs.map((p) => [oids.get(p.a) as string, oids.get(p.b) as string] as [string, string]),
+    opts,
+  );
+  const collisions: Collision[] = [];
+  jobs.forEach((p, k) => {
+    const r = results[k] as { files: string[] } | { error: Error };
+    if ('error' in r) onSkip?.(p.a, p.b, r.error.message);
+    else if (r.files.length > 0) collisions.push({ prA: p.a, prB: p.b, files: r.files, severity: 'textual' });
+  });
   return collisions;
 }
 

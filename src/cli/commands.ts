@@ -18,8 +18,12 @@ import {
   type MatchOptions,
 } from '../forecast/paths.js';
 import { forecastWorktrees } from '../forecast/worktrees.js';
+import { deepForecast, type DeepRef } from '../forecast/deep.js';
+import { regenHint } from '../forecast/generated.js';
 import { findGitRoot, currentBranch, listLocalBranches, git, tryGit, CeasefireGitError } from '../forecast/git.js';
 import { broadcastIntent, fetchRemoteIntents } from './sync.js';
+import { AUTO_LEASE_TASK } from '../intent/index.js';
+import { statSync, utimesSync } from 'node:fs';
 import {
   formatBlockedMessage,
   formatClearMessage,
@@ -29,7 +33,7 @@ import {
   type Contention,
   type CheckReport,
 } from './format.js';
-import { EXIT_CLEAR, EXIT_ERROR, EXIT_ADVISORY, EXIT_BLOCKED, type Intent, type Verdict } from '../types.js';
+import { EXIT_CLEAR, EXIT_ERROR, EXIT_ADVISORY, EXIT_BLOCKED, type Collision, type Intent, type Verdict } from '../types.js';
 
 export interface Ctx {
   cwd: string;
@@ -253,6 +257,90 @@ export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): C
 }
 
 /* ------------------------------------------------------------------ */
+/* auto-lease (editor hook)                                            */
+/* ------------------------------------------------------------------ */
+
+/** Default sliding lease: a session that stops editing stops holding files after this long. */
+export const DEFAULT_LEASE_MS = 15 * 60_000;
+
+export function leaseTtlMs(): number {
+  const raw = process.env.CEASEFIRE_LEASE_TTL;
+  if (raw) {
+    const t = parseTtl(raw);
+    if (t !== null) return t;
+  }
+  return DEFAULT_LEASE_MS;
+}
+
+/**
+ * Record that this agent is editing `files` (repo-relative, canonical):
+ * create or extend its auto-lease. Broadcast to other machines on creation
+ * and, at most every CEASEFIRE_LEASE_BROADCAST_S (default 30) seconds, when
+ * the lease gains a file, so a busy session does not push once per edit.
+ * Never throws: leasing is a courtesy and must not break an edit.
+ */
+export function claimLease(ctx: Ctx, files: string[], now: number = Date.now()): Intent | null {
+  if (files.length === 0) return null;
+  let store: IntentStore | null = null;
+  try {
+    store = openStore(ctx.cwd);
+    const agent = currentAgent();
+    const branch = currentBranchName(ctx.cwd);
+    let last: { intent: Intent; created: boolean; pathAdded: boolean } | null = null;
+    let created = false;
+    let added = false;
+    for (const f of files) {
+      last = store.touchLease(f, { agent, branch, ttlMs: leaseTtlMs(), now });
+      created ||= last.created;
+      added ||= last.pathAdded;
+    }
+    if (last && (created || added)) {
+      const stamp = join(resolveStoreDir(ctx.cwd), `lease-broadcast-${last.intent.id.slice(0, 8)}`);
+      const every = Math.max(0, Number(process.env.CEASEFIRE_LEASE_BROADCAST_S ?? '30') || 0) * 1000;
+      let due = created;
+      if (!due) {
+        try {
+          due = now - statSync(stamp).mtimeMs >= every;
+        } catch {
+          due = true;
+        }
+      }
+      if (due) {
+        try {
+          writeFileSync(stamp, '');
+          utimesSync(stamp, new Date(now), new Date(now));
+        } catch {
+          /* stamp is an optimisation only */
+        }
+        broadcastIntent(ctx.cwd, last.intent);
+      }
+    }
+    return last?.intent ?? null;
+  } catch {
+    return null;
+  } finally {
+    store?.close();
+  }
+}
+
+/** Release this agent's auto-leases (session ended). Returns how many were released. */
+export function releaseLeases(ctx: Ctx, now: number = Date.now()): number {
+  let store: IntentStore | null = null;
+  try {
+    store = openStore(ctx.cwd);
+    const done = store.completeAll(currentAgent(), { onlyLeases: true, now });
+    for (const i of done) broadcastIntent(ctx.cwd, i);
+    return done.length;
+  } catch {
+    return 0;
+  } finally {
+    store?.close();
+  }
+}
+
+export { AUTO_LEASE_TASK };
+
+/* ------------------------------------------------------------------ */
 /* start / done                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -282,11 +370,29 @@ export function cmdStart(ctx: Ctx, task: string, paths: string[], ttlMs?: number
   }
 }
 
-export function cmdDone(ctx: Ctx, id?: string, now: number = Date.now()): CommandResult {
+export function cmdDone(ctx: Ctx, id?: string, now: number = Date.now(), all = false): CommandResult {
   const agent = currentAgent();
   const store = openStore(ctx.cwd);
   try {
     const mine = allActiveIntents(ctx.cwd, store, now).filter((i) => i.agent === agent);
+    if (all) {
+      if (id) return err('--all and --id cannot be combined');
+      const finished: Intent[] = [];
+      for (const target of mine) {
+        if (!store.get(target.id)) store.upsert(target);
+        const updated = store.complete(target.id);
+        if (updated) {
+          broadcastIntent(ctx.cwd, updated);
+          finished.push(updated);
+        }
+      }
+      return {
+        exitCode: EXIT_CLEAR,
+        stdout: ctx.json
+          ? JSON.stringify({ completed: finished }, null, 2) + '\n'
+          : `ceasefire: completed ${finished.length} intent(s) for "${sanitizeDisplay(agent)}".\n`,
+      };
+    }
     if (mine.length === 0) {
       return err(`no active intent for agent "${sanitizeDisplay(agent)}" on this machine. Nothing to complete.`);
     }
@@ -338,6 +444,23 @@ export interface ConflictsOptions {
   worktrees?: boolean;
   /** With `worktrees`: also include new, non-ignored files. */
   untracked?: boolean;
+  /** Also report files both sides changed that git merges cleanly (severity "overlap"). */
+  overlap?: boolean;
+  /** Also report removed exports still used by the other side's new code (severity "semantic", confidence high). */
+  semantic?: boolean;
+  /** Also report import-graph neighbors (severity "semantic", confidence low). */
+  neighbors?: boolean;
+  /** With `exitCode`: collisions made only of lockfiles/generated files do not count. */
+  ignoreRegenerable?: boolean;
+}
+
+/** Mark textual collisions made only of lockfiles/generated files as regenerable. */
+export function annotateRegenerable(collisions: Collision[]): Collision[] {
+  return collisions.map((c) => {
+    if (c.severity !== 'textual') return c;
+    const hint = regenHint(c.files);
+    return hint ? { ...c, regenerable: true, hint } : c;
+  });
 }
 
 export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: ConflictsOptions = {}): CommandResult {
@@ -352,7 +475,8 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
     // --worktrees promises a read-only run: no fetch (which writes refs/ceasefire/* and FETCH_HEAD).
     const intents = allActiveIntents(ctx.cwd, store, now, { fetch: !opts.worktrees });
     const match = matchOptions(ctx.cwd, root);
-    let collisions;
+    let collisions: Collision[];
+    let deepRefs: DeepRef[] = [];
     if (opts.worktrees) {
       const wf = forecastWorktrees(ctx.cwd, { includeUntracked: opts.untracked ?? false });
       worktrees = wf.worktrees.map((w) => ({ path: w.path, branch: w.branch, label: w.label, dirty: w.dirty }));
@@ -364,6 +488,7 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
         skipped.push('ceasefire: note — only one worktree found; add agents with `git worktree add` to compare their uncommitted work.');
       }
       collisions = [...wf.collisions, ...intentCollisions(intents, now, match)];
+      deepRefs = wf.worktrees.map((w) => ({ label: `${w.label} [worktree]`, oid: w.snapshot }));
     } else {
       try {
         branches = listLocalBranches(ctx.cwd);
@@ -373,9 +498,29 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
       collisions = buildCollisionMatrix(ctx.cwd, branches, intents, now, (a, b, reason) => {
         skipped.push(`ceasefire: warning — could not forecast ${sanitizeDisplay(a)} <-> ${sanitizeDisplay(b)}: ${sanitizeDisplay(reason)}`);
       }, match);
+      if (opts.overlap || opts.semantic || opts.neighbors) {
+        for (const b of branches) {
+          const oid = tryGit(ctx.cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${b}^{commit}`]);
+          if (oid) deepRefs.push({ label: b, oid });
+        }
+      }
     }
+    if (opts.overlap || opts.semantic || opts.neighbors) {
+      const textual = new Map<string, string[]>();
+      for (const c of collisions) if (c.severity === 'textual') textual.set(`${c.prA}\0${c.prB}`, c.files);
+      const deep = deepForecast(ctx.cwd, deepRefs, {
+        overlap: opts.overlap ?? false,
+        semantic: opts.semantic ?? false,
+        neighbors: opts.neighbors ?? false,
+        textual,
+      });
+      collisions = [...collisions, ...deep.collisions];
+      for (const n of deep.notes) skipped.push(`ceasefire: note — ${sanitizeDisplay(n)}`);
+    }
+    collisions = annotateRegenerable(collisions);
     const stderr = skipped.length > 0 ? skipped.join('\n') + '\n' : undefined;
-    const exitCode = opts.exitCode && collisions.length > 0 ? EXIT_ADVISORY : EXIT_CLEAR;
+    const counted = opts.ignoreRegenerable ? collisions.filter((c) => !c.regenerable) : collisions;
+    const exitCode = opts.exitCode && counted.length > 0 ? EXIT_ADVISORY : EXIT_CLEAR;
     const scope = worktrees
       ? `${worktrees.length} worktree(s) (${worktrees.filter((w) => w.dirty).length} with uncommitted changes)`
       : `${branches.length} branch(es)`;
@@ -407,9 +552,10 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
       `ceasefire: ${collisions.length} collision(s) across ${scope}:`,
       ...collisions.map(
         (c) =>
-          `  [${c.severity.toUpperCase()}] ${sanitizeDisplay(c.prA)} <-> ${sanitizeDisplay(c.prB)}\n` +
+          `  [${c.severity.toUpperCase()}${c.confidence ? `, ${c.confidence} confidence` : ''}${c.regenerable ? ', regenerable' : ''}] ${sanitizeDisplay(c.prA)} <-> ${sanitizeDisplay(c.prB)}\n` +
           `      files: ${c.files.map(sanitizeDisplay).join(', ')}` +
-          (c.detail ? `\n      ${sanitizeDisplay(c.detail)}` : ''),
+          (c.detail ? `\n      ${sanitizeDisplay(c.detail)}` : '') +
+          (c.hint ? `\n      fix: ${sanitizeDisplay(c.hint)}` : ''),
       ),
     ];
     return { exitCode, stdout: lines.join('\n') + '\n', ...(stderr !== undefined ? { stderr } : {}) };
@@ -442,6 +588,74 @@ export function cmdList(ctx: Ctx, now: number = Date.now()): CommandResult {
       );
       for (const p of i.paths.slice(0, 20)) lines.push(`      ${sanitizeDisplay(p)}`);
       if (i.paths.length > 20) lines.push(`      … and ${i.paths.length - 20} more`);
+    }
+    return { exitCode: EXIT_CLEAR, stdout: lines.join('\n') + '\n' };
+  } finally {
+    store.close();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* status                                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Who is editing what, right now. Reads the local ledger plus intent refs
+ * already fetched (no network, no writes), so it is cheap enough to back a
+ * status line that refreshes every few seconds.
+ */
+export function cmdStatus(ctx: Ctx, opts: { oneline?: boolean } = {}, now: number = Date.now()): CommandResult {
+  if (!findGitRoot(ctx.cwd)) return err('not a git repository.');
+  const store = openStore(ctx.cwd);
+  try {
+    const intents = allActiveIntents(ctx.cwd, store, now, { fetch: false });
+    const match = matchOptions(ctx.cwd);
+    const contested = intentCollisions(intents, now, match);
+    const agents = new Map<string, Intent[]>();
+    for (const i of intents) agents.set(i.agent, [...(agents.get(i.agent) ?? []), i]);
+    const held = new Set(intents.flatMap((i) => i.paths));
+    const contestedFiles = [...new Set(contested.flatMap((c) => c.files))].sort();
+    const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? '' : 's'}`;
+    const headline =
+      agents.size === 0
+        ? 'ceasefire: idle (no agent holds any file)'
+        : `ceasefire: ${plural(agents.size, 'agent')} editing, ${plural(held.size, 'path')} held` +
+          (contestedFiles.length > 0 ? `, ${plural(contestedFiles.length, 'file')} CONTESTED` : '');
+    if (opts.oneline) return { exitCode: EXIT_CLEAR, stdout: headline + '\n' };
+    if (ctx.json) {
+      return {
+        exitCode: EXIT_CLEAR,
+        stdout:
+          JSON.stringify(
+            {
+              agents: [...agents.entries()].map(([agent, list]) => ({
+                agent,
+                branches: [...new Set(list.map((i) => i.branch))],
+                paths: [...new Set(list.flatMap((i) => i.paths))],
+                expiresInMs: Math.max(...list.map((i) => i.expiresAt - now)),
+              })),
+              contested: contested,
+              generatedAt: now,
+            },
+            null,
+            2,
+          ) + '\n',
+      };
+    }
+    const lines = [headline];
+    for (const [agent, list] of agents) {
+      const paths = [...new Set(list.flatMap((i) => i.paths))];
+      const left = Math.max(...list.map((i) => i.expiresAt - now));
+      lines.push(
+        `  ${sanitizeDisplay(agent)}${agent === currentAgent() ? ' (you)' : ''} on ${[...new Set(list.map((i) => sanitizeDisplay(i.branch)))].join(', ')}` +
+          ` — ${plural(paths.length, 'path')}, lease ends in ${formatDuration(left)}`,
+      );
+      for (const p of paths.slice(0, 6)) lines.push(`      ${sanitizeDisplay(p)}`);
+      if (paths.length > 6) lines.push(`      … and ${paths.length - 6} more`);
+    }
+    if (contested.length > 0) {
+      lines.push('', 'Contested (two agents hold the same paths):');
+      for (const c of contested) lines.push(`  ${sanitizeDisplay(c.prA)} <-> ${sanitizeDisplay(c.prB)}: ${c.files.map(sanitizeDisplay).join(', ')}`);
     }
     return { exitCode: EXIT_CLEAR, stdout: lines.join('\n') + '\n' };
   } finally {
@@ -587,13 +801,17 @@ jobs:
 
 /** The PreToolUse entry `ceasefire init --claude` adds to .claude/settings.json. */
 export const CLAUDE_HOOK_COMMAND = 'ceasefire hook claude';
+/** SessionEnd entry: releases the session's auto-leases at once. */
+export const CLAUDE_RELEASE_COMMAND = 'ceasefire hook release';
+/** Status line command (opt-in: `ceasefire init --claude --statusline`). */
+export const CLAUDE_STATUSLINE_COMMAND = 'ceasefire status --oneline';
 
 /**
  * Merge ceasefire's PreToolUse hook into <root>/.claude/settings.json.
  * Never clobbers: an unparseable or oddly-shaped settings file is left
  * untouched and reported; an existing ceasefire entry is not duplicated.
  */
-export function installClaudeHook(root: string, opts: { strict?: boolean } = {}): { ok: boolean; note: string } {
+export function installClaudeHook(root: string, opts: { strict?: boolean; statusline?: boolean } = {}): { ok: boolean; note: string } {
   const dir = join(root, '.claude');
   const file = join(dir, 'settings.json');
   let settings: Record<string, unknown> = {};
@@ -613,19 +831,37 @@ export function installClaudeHook(root: string, opts: { strict?: boolean } = {})
   const pre = (hooks['PreToolUse'] ?? []) as unknown;
   if (!Array.isArray(pre)) return { ok: false, note: '.claude/settings.json "hooks.PreToolUse" is not an array; left untouched' };
   const already = JSON.stringify(pre).includes(CLAUDE_HOOK_COMMAND);
-  if (already) return { ok: true, note: 'Claude Code hook already present in .claude/settings.json' };
-  pre.push({
+  const extras: string[] = [];
+  let changed = !already;
+  if (!already) pre.push({
     matcher: 'Write|Edit|MultiEdit|NotebookEdit',
     hooks: [
       opts.strict
         ? // onFailure "block": a hook that crashes, times out or is missing from
           // PATH denies the edit instead of letting it through (Claude Code >= v2.1.295).
-          { type: 'command', command: `${CLAUDE_HOOK_COMMAND} --strict`, timeout: 30, onFailure: 'block' }
-        : { type: 'command', command: CLAUDE_HOOK_COMMAND, timeout: 30 },
+          { type: 'command', command: `${CLAUDE_HOOK_COMMAND} --strict --claim`, timeout: 30, onFailure: 'block' }
+        : { type: 'command', command: `${CLAUDE_HOOK_COMMAND} --claim`, timeout: 30 },
     ],
   });
   hooks['PreToolUse'] = pre;
+  const end = (hooks['SessionEnd'] ?? []) as unknown;
+  if (Array.isArray(end) && !JSON.stringify(end).includes(CLAUDE_RELEASE_COMMAND)) {
+    end.push({ hooks: [{ type: 'command', command: CLAUDE_RELEASE_COMMAND, timeout: 10 }] });
+    hooks['SessionEnd'] = end;
+    extras.push('SessionEnd release hook');
+    changed = true;
+  }
+  if (opts.statusline) {
+    if (settings['statusLine'] === undefined) {
+      settings['statusLine'] = { type: 'command', command: CLAUDE_STATUSLINE_COMMAND };
+      extras.push('status line');
+      changed = true;
+    } else if (!JSON.stringify(settings['statusLine']).includes(CLAUDE_STATUSLINE_COMMAND)) {
+      extras.push('status line left alone (you already have one)');
+    }
+  }
   settings['hooks'] = hooks;
+  if (!changed) return { ok: true, note: `Claude Code hook already present in .claude/settings.json${extras.length ? ` (${extras.join('; ')})` : ''}` };
   mkdirSync(dir, { recursive: true });
   const tmp = `${file}.ceasefire-tmp`;
   writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n');
@@ -633,12 +869,12 @@ export function installClaudeHook(root: string, opts: { strict?: boolean } = {})
   return {
     ok: true,
     note:
-      `Claude Code PreToolUse hook (${opts.strict ? 'strict, onFailure "block", needs Claude Code >= v2.1.295' : 'advisory'}) ` +
-      'added to .claude/settings.json (needs `ceasefire` on PATH: npm i -g ceasefire)',
+      `Claude Code PreToolUse hook (${opts.strict ? 'strict, onFailure "block", needs Claude Code >= v2.1.295' : 'advisory'}, auto-lease on) ` +
+      `added to .claude/settings.json${extras.length ? ` with ${extras.join(' + ')}` : ''} (needs \`ceasefire\` on PATH: npm i -g ceasefire)`,
   };
 }
 
-export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean } = {}): CommandResult {
+export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean; statusline?: boolean } = {}): CommandResult {
   const root = findGitRoot(ctx.cwd);
   if (!root) return err('not a git repository. Run `ceasefire init` inside a git checkout.');
   let gitDir: string;
@@ -699,7 +935,7 @@ export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean } =
     notes.push('created .gitignore ignoring .ceasefire/ (intent DB is local state, never committed)');
   }
 
-  if (opts.claude) notes.push(installClaudeHook(root, { strict: opts.strict ?? false }).note);
+  if (opts.claude) notes.push(installClaudeHook(root, { strict: opts.strict ?? false, statusline: opts.statusline ?? false }).note);
 
   notes.push('agents: add `ceasefire check <files>` before editing shared files (1 line in AGENTS.md)');
   const body = notes.map((n) => `  - ${n}`).join('\n');

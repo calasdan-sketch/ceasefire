@@ -112,7 +112,7 @@ test('F2: init --claude --strict writes onFailure "block" and the --strict hook'
   installClaudeHook(repo, { strict: true });
   const h = JSON.parse(readFileSync(join(repo, '.claude', 'settings.json'), 'utf8')).hooks.PreToolUse[0].hooks[0];
   assert.equal(h.onFailure, 'block');
-  assert.equal(h.command, `${CLAUDE_HOOK_COMMAND} --strict`);
+  assert.equal(h.command, `${CLAUDE_HOOK_COMMAND} --strict --claim`);
   const loose = makeRepo();
   installClaudeHook(loose);
   const l = JSON.parse(readFileSync(join(loose, '.claude', 'settings.json'), 'utf8')).hooks.PreToolUse[0].hooks[0];

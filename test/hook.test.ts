@@ -86,7 +86,7 @@ test('init --claude merges into existing settings without clobbering and is idem
   const s = JSON.parse(readFileSync(join(repo, '.claude', 'settings.json'), 'utf8'));
   assert.equal(s.model, 'keep-me');
   assert.equal(s.hooks.PreToolUse.length, 2, 'existing hook kept, ours added once');
-  assert.equal(s.hooks.PreToolUse[1].hooks[0].command, CLAUDE_HOOK_COMMAND);
+  assert.equal(s.hooks.PreToolUse[1].hooks[0].command, `${CLAUDE_HOOK_COMMAND} --claim`);
 });
 
 test('init --claude refuses to touch an unparseable settings file', () => {

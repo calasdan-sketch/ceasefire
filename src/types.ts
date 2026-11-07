@@ -27,10 +27,13 @@ export interface Intent {
  * Collision severity.
  * - textual: git merge-tree found conflicting hunks between two branches.
  * - intent: two active intents claim overlapping paths (advisory only).
- * - semantic: reserved for the v1.1 post-merge verifier (import collisions,
- *   duplicate symbols). No v1 producer emits this severity.
+ * - semantic: a removed export is still used by the other side's new code
+ *   (confidence "high"), or the sides changed import neighbors ("low");
+ *   produced by `ceasefire conflicts --deep` / `--neighbors`.
+ * - overlap: both sides changed the same file and git merges it cleanly
+ *   (`--overlap` / `--deep`).
  */
-export type CollisionSeverity = 'textual' | 'intent' | 'semantic';
+export type CollisionSeverity = 'textual' | 'intent' | 'semantic' | 'overlap';
 
 /** One pairwise collision in the forecast matrix. */
 export interface Collision {
@@ -43,6 +46,12 @@ export interface Collision {
   severity: CollisionSeverity;
   /** Extra context, e.g. the intent task that holds the files. */
   detail?: string;
+  /** How sure a deep-forecast finding is. Absent for textual/intent findings. */
+  confidence?: 'high' | 'low';
+  /** Textual collision made only of lockfiles/generated files: regenerate, do not negotiate. */
+  regenerable?: boolean;
+  /** What to do for a regenerable collision. */
+  hint?: string;
 }
 
 /** Verdict of `ceasefire check`. */
