@@ -4,7 +4,7 @@
  * warning never pollutes agent-facing output.
  */
 import { readFileSync } from 'node:fs';
-import { cmdCheck, cmdConflicts, cmdDone, cmdInit, cmdList, cmdStart, cmdStatus, cmdSuggest, parseTtl, type Ctx } from './commands.js';
+import { cmdCheck, cmdConflicts, cmdDoctor, cmdDone, cmdInit, cmdList, cmdStart, cmdStatus, cmdSuggest, parseTtl, type Ctx } from './commands.js';
 import { runClaudeHook, runReleaseHook, MAX_HOOK_INPUT_BYTES } from './hook.js';
 import { EXIT_ERROR } from '../types.js';
 
@@ -20,6 +20,7 @@ function version(): string {
 }
 
 const VERSION = version();
+const MAX_STDIN_PATH_BYTES = 4 * 1024 * 1024;
 
 interface Parsed {
   command?: string;
@@ -46,6 +47,7 @@ interface Parsed {
   all: boolean;
   oneline: boolean;
   statusline: boolean;
+  stdin: boolean;
 }
 
 function parseArgs(argv: string[]): Parsed {
@@ -71,6 +73,7 @@ function parseArgs(argv: string[]): Parsed {
     all: false,
     oneline: false,
     statusline: false,
+    stdin: false,
   };
   let i = 0;
   while (i < argv.length) {
@@ -102,6 +105,7 @@ function parseArgs(argv: string[]): Parsed {
       else if (name === 'all') out.all = true;
       else if (name === 'oneline') out.oneline = true;
       else if (name === 'statusline') out.statusline = true;
+      else if (name === 'stdin') out.stdin = true;
       else if (name === 'overlap') out.overlap = true;
       else if (name === 'semantic') out.semantic = true;
       else if (name === 'neighbors') out.neighbors = true;
@@ -144,6 +148,8 @@ Usage:
                                            --strict: hook denies collisions, onFailure "block";
                                            --statusline: show "ceasefire status --oneline" in Claude Code)
   ceasefire check <files...> [--json]     pre-edit collision check (paths may be absolute)
+        [--claim]                         also hold the files (auto-lease) when you may proceed: for agents without the Claude hook
+        [--stdin]                         read more file names from stdin, one per line (git diff --name-only | ceasefire check --stdin)
   ceasefire start "<task>" --paths <...>  publish an intent (advisory; paths or globs like 'src/**/*.ts')
         [--ttl 30m|2h|1d]                 intent lifetime (default 4h, 1m..7d)
   ceasefire done [--id <id> | --all]      complete your active intent (or all of them)
@@ -156,6 +162,7 @@ Usage:
         [--overlap|--semantic|--neighbors] pick individual deep checks (--neighbors = import-graph, noisy)
         [--exit-code [--ignore-regenerable]] exit 2 on any collision (lockfile-only ones optional)
   ceasefire suggest [files...] [--json]   unclaimed files to work on instead
+  ceasefire doctor [--json]               check this machine is set up so agents warn each other
   ceasefire hook claude [--ask|--strict] [--claim]
                                           Claude Code PreToolUse hook (reads the event on stdin);
                                           --claim keeps a 15-minute sliding lease on every file the session edits
@@ -173,6 +180,11 @@ function fail(message: string): never {
 }
 
 async function main(): Promise<void> {
+  // `ceasefire conflicts | head` closes the pipe early: that is not an error worth a stack trace.
+  process.stdout.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code === 'EPIPE') process.exit(process.exitCode ?? 0);
+    throw e;
+  });
   let parsed: Parsed;
   try {
     parsed = parseArgs(process.argv.slice(2));
@@ -209,7 +221,14 @@ async function main(): Promise<void> {
       return emit(cmdInit(ctx, { claude: parsed.claude, strict: parsed.strict, statusline: parsed.statusline }));
     }
     case 'check': {
-      return emit(cmdCheck(ctx, parsed.positionals));
+      let files = parsed.positionals;
+      if (parsed.stdin) {
+        if (process.stdin.isTTY) fail('--stdin reads file names (one per line, or NUL-separated) from a pipe, e.g. `git diff --name-only | ceasefire check --stdin`');
+        const input = await readStdin(MAX_STDIN_PATH_BYTES);
+        if (input.overflow) fail('--stdin: more than 4MB of file names');
+        files = [...files, ...input.text.split(input.text.includes('\0') ? '\0' : '\n').map((l) => l.replace(/\r$/, '')).filter((l) => l.trim() !== '')];
+      }
+      return emit(cmdCheck(ctx, files, Date.now(), { claim: parsed.claim }));
     }
     case 'start': {
       const [task] = parsed.positionals;
@@ -255,6 +274,10 @@ async function main(): Promise<void> {
     case 'status': {
       if (parsed.positionals.length > 0) fail('usage: ceasefire status [--oneline] [--json]');
       return emit(cmdStatus(ctx, { oneline: parsed.oneline }));
+    }
+    case 'doctor': {
+      if (parsed.positionals.length > 0) fail('usage: ceasefire doctor [--json]');
+      return emit(cmdDoctor(ctx));
     }
     case 'suggest': {
       return emit(cmdSuggest(ctx, parsed.positionals));

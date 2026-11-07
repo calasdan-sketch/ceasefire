@@ -52,6 +52,11 @@ export interface Collision {
   regenerable?: boolean;
   /** What to do for a regenerable collision. */
   hint?: string;
+  /**
+   * Intent collisions only: the side that should step aside. The earlier claim (then the lower id)
+   * keeps priority; both agents compute the same answer, so they converge without negotiating.
+   */
+  yields?: string;
 }
 
 /** Verdict of `ceasefire check`. */

@@ -27,7 +27,7 @@ function fakeSdk() {
 const LIST = 'tools/list';
 const CALL = 'tools/call';
 
-test('server lists ceasefire_check and ceasefire_conflicts', async () => {
+test('server lists the five ceasefire tools', async () => {
   const { sdk, handlers } = fakeSdk();
   const opts: ServerOptions = { bin: '/fake/ceasefire' };
   buildServer(sdk, opts);
@@ -35,7 +35,7 @@ test('server lists ceasefire_check and ceasefire_conflicts', async () => {
   assert.ok(list, 'list handler registered');
   const res = (await list({})) as { tools: Array<{ name: string }> };
   const names = res.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['ceasefire_check', 'ceasefire_conflicts']);
+  assert.deepEqual(names, ['ceasefire_check', 'ceasefire_claim', 'ceasefire_conflicts', 'ceasefire_release', 'ceasefire_status']);
 });
 
 test('ceasefire_check call delegates to runCheckTool with the resolved bin', async () => {

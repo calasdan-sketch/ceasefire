@@ -23,7 +23,8 @@
  * Intent collisions are advisory: two *active* intents from *different*
  * agents whose claimed paths overlap (exact match or directory prefix).
  */
-import { git, gitResult, mergeBase, CeasefireGitError } from './git.js';
+import { git, gitResult, mergeBase, CeasefireGitError, withObjectQuarantine, resolveCommits } from './git.js';
+import { relatedTips, type Related } from './ancestry.js';
 import { mergeTreeBatch, gitSupportsMergeTreeStdin } from './batch.js';
 export { mergeBase } from './git.js';
 import type { Collision, Intent } from '../types.js';
@@ -207,19 +208,24 @@ export function textualCollisions(
   cwd: string,
   branches: string[],
   onSkip?: (a: string, b: string, reason: string) => void,
-  opts: { batch?: boolean } = {},
+  opts: { batch?: boolean; related?: Related } = {},
+): Collision[] {
+  return withObjectQuarantine(cwd, () => textualCollisionsInner(cwd, branches, onSkip, opts));
+}
+
+function textualCollisionsInner(
+  cwd: string,
+  branches: string[],
+  onSkip: ((a: string, b: string, reason: string) => void) | undefined,
+  opts: { batch?: boolean; related?: Related },
 ): Collision[] {
   const unique = [...new Set(branches)];
   // Resolve every branch to a commit id once (N cheap calls) so the N^2 merges can
   // travel on one stdin stream. An unreadable ref only skips the pairs it is in.
-  const oids = new Map<string, string>();
+  const oids = resolveCommits(cwd, unique);
   const bad = new Map<string, string>();
-  for (const b of unique) {
-    const r = gitResult(cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${b}^{commit}`]);
-    const oid = r.stdout.trim();
-    if (r.exitCode === 0 && /^[0-9a-f]{40,64}$/.test(oid)) oids.set(b, oid);
-    else bad.set(b, r.stderr.trim() || `cannot resolve "${b}" to a commit`);
-  }
+  for (const b of unique) if (!oids.has(b)) bad.set(b, `cannot resolve "${b}" to a commit`);
+  const related = opts.related ?? relatedTips(cwd, [...oids.values()]);
   const jobs: Array<{ a: string; b: string }> = [];
   for (let i = 0; i < unique.length; i++) {
     for (let j = i + 1; j < unique.length; j++) {
@@ -227,6 +233,7 @@ export function textualCollisions(
       const b = unique[j] as string;
       const why = bad.get(a) ?? bad.get(b);
       if (why !== undefined) onSkip?.(a, b, why);
+      else if (related(oids.get(a) as string, oids.get(b) as string)) continue; // fast-forward: cannot conflict
       else jobs.push({ a, b });
     }
   }
@@ -273,12 +280,16 @@ export function intentCollisions(intents: Intent[], now: number = Date.now(), ma
         ),
       ].sort();
       if (files.length > 0) {
+        const labelA = `${a.agent}/${a.branch} (${a.id.slice(0, 8)})`;
+        const labelB = `${b.agent}/${b.branch} (${b.id.slice(0, 8)})`;
+        const aFirst = a.createdAt < b.createdAt || (a.createdAt === b.createdAt && a.id < b.id);
         collisions.push({
-          prA: `${a.agent}/${a.branch} (${a.id.slice(0, 8)})`,
-          prB: `${b.agent}/${b.branch} (${b.id.slice(0, 8)})`,
+          prA: labelA,
+          prB: labelB,
           files,
           severity: 'intent',
           detail: `"${a.task}" vs "${b.task}"`,
+          yields: aFirst ? labelB : labelA,
         });
       }
     }
@@ -294,6 +305,7 @@ export function buildCollisionMatrix(
   now: number = Date.now(),
   onSkipPair?: (a: string, b: string, reason: string) => void,
   match: MatchOptions = {},
+  related?: Related,
 ): Collision[] {
-  return [...textualCollisions(cwd, branches, onSkipPair), ...intentCollisions(intents, now, match)];
+  return [...textualCollisions(cwd, branches, onSkipPair, related ? { related } : {}), ...intentCollisions(intents, now, match)];
 }

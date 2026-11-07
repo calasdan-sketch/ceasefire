@@ -17,8 +17,16 @@ import type { Intent } from '../types.js';
 
 const REF_PREFIX = 'refs/ceasefire/intents/';
 
-/** Upper bound on intent refs pulled per fetch — bounds a flooding peer. */
+/** Upper bound on intents kept per read (newest active first) — bounds a flooding peer. */
 const MAX_REMOTE_INTENTS = 500;
+/** Upper bound on intent refs inspected per read. Stale refs are pruned, so this is far above normal use. */
+const MAX_REF_SCAN = 5000;
+/** The longest lifetime `ceasefire start --ttl` allows; a broadcast claiming more is not from ceasefire. */
+const MAX_INTENT_LIFETIME_MS = 7 * 86_400_000;
+/** Clock-skew allowance between machines. */
+const CLOCK_SKEW_MS = 3_600_000;
+/** An expired or finished intent ref is deleted once it has been dead this long. */
+const PRUNE_GRACE_MS = 86_400_000;
 /** Upper bound on a single intent blob — the local DB must not bloat. */
 const MAX_INTENT_BLOB_BYTES = 64 * 1024;
 /** Intent ids travel inside git ref names; keep them ref-safe. */
@@ -35,7 +43,7 @@ function syncEnabled(cwd: string): boolean {
  * the shape is checked strictly: wrong types, oversized blobs, or ref-
  * unsafe ids are dropped, never imported.
  */
-function isValidRemoteIntent(parsed: unknown): parsed is Intent {
+export function isValidRemoteIntent(parsed: unknown, now: number = Date.now()): parsed is Intent {
   if (typeof parsed !== 'object' || parsed === null) return false;
   const p = parsed as Record<string, unknown>;
   if (typeof p['id'] !== 'string' || !SAFE_ID_RE.test(p['id'])) return false;
@@ -45,6 +53,10 @@ function isValidRemoteIntent(parsed: unknown): parsed is Intent {
   if (!Array.isArray(p['paths']) || !p['paths'].every((x) => typeof x === 'string')) return false;
   if (!Number.isFinite(p['createdAt']) || !Number.isFinite(p['expiresAt'])) return false;
   if (p['status'] !== 'active' && p['status'] !== 'done' && p['status'] !== 'expired') return false;
+  // A planted claim that never expires (or starts in the future) would hold files for every agent, and under
+  // strict mode block their edits, forever. ceasefire itself never publishes more than 7 days.
+  if ((p['expiresAt'] as number) > now + MAX_INTENT_LIFETIME_MS + CLOCK_SKEW_MS) return false;
+  if ((p['createdAt'] as number) > now + CLOCK_SKEW_MS) return false;
   // Keep absurd values out of the local DB: 10k paths or a 1MB task string
   // from a planted ref would slow every `ceasefire check`.
   if ((p['paths'] as string[]).length > 1000) return false;
@@ -154,34 +166,102 @@ function maybeFetch(cwd: string): void {
  * written. All blobs are read with one `git cat-file --batch`. Best-effort:
  * never throws, returns [] when sync is disabled or anything fails.
  */
-export function fetchRemoteIntents(cwd: string, opts: { fetch?: boolean } = {}): Intent[] {
+export function fetchRemoteIntents(cwd: string, opts: { fetch?: boolean; now?: number } = {}): Intent[] {
   if (!syncEnabled(cwd)) return [];
   try {
     if (opts.fetch ?? true) maybeFetch(cwd);
-    const refs = tryGit(cwd, ['for-each-ref', '--format=%(objectname) %(objecttype) %(objectsize)', REF_PREFIX]);
-    if (!refs) return [];
-    const oids: string[] = [];
-    for (const line of refs.split('\n').slice(0, MAX_REMOTE_INTENTS)) {
-      const [oid, type, size] = line.trim().split(' ');
-      if (!oid || !/^[0-9a-f]{40,64}$/.test(oid) || type !== 'blob') continue;
-      if (Number(size) > MAX_INTENT_BLOB_BYTES) continue; // never even read oversized blobs
-      oids.push(oid);
-    }
-    if (oids.length === 0) return [];
-    const out = gitResult(cwd, ['cat-file', '--batch'], { input: oids.join('\n') + '\n' });
-    if (out.exitCode !== 0) return [];
-    return parseBatch(out.stdout).flatMap((blob) => {
-      try {
-        const parsed: unknown = JSON.parse(blob);
-        return isValidRemoteIntent(parsed) ? [parsed] : [];
-      } catch {
-        return [];
-      }
-    });
+    return readIntentRefs(cwd, opts.now ?? Date.now()).intents;
   } catch {
     return [];
   }
 }
+
+interface RefScan {
+  intents: Intent[];
+  /** Refs that are safe to delete: dead for over a day, malformed, oversized or not a blob. */
+  stale: string[];
+}
+
+function readIntentRefs(cwd: string, now: number): RefScan {
+  const listing = tryGit(cwd, ['for-each-ref', '--format=%(refname) %(objectname) %(objecttype) %(objectsize)', REF_PREFIX]);
+  if (!listing) return { intents: [], stale: [] };
+  const stale: string[] = [];
+  const wanted: Array<{ ref: string; oid: string }> = [];
+  for (const line of listing.split('\n').slice(0, MAX_REF_SCAN)) {
+    const [ref, oid, type, size] = line.trim().split(' ');
+    if (!ref || !oid || !/^[0-9a-f]{40,64}$/.test(oid)) continue;
+    if (type !== 'blob' || Number(size) > MAX_INTENT_BLOB_BYTES) {
+      stale.push(ref); // never even read oversized blobs
+      continue;
+    }
+    wanted.push({ ref, oid });
+  }
+  if (wanted.length === 0) return { intents: [], stale };
+  const out = gitResult(cwd, ['cat-file', '--batch'], { input: wanted.map((w) => w.oid).join('\n') + '\n' });
+  if (out.exitCode !== 0) return { intents: [], stale };
+  const blobs = parseBatch(out.stdout);
+  const intents: Intent[] = [];
+  // parseBatch skips "missing" headers, so only trust the pairing when every blob came back.
+  const paired = blobs.length === wanted.length;
+  blobs.forEach((blob, k) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(blob);
+    } catch {
+      if (paired) stale.push((wanted[k] as { ref: string }).ref);
+      return;
+    }
+    if (!isValidRemoteIntent(parsed, now)) {
+      if (paired) stale.push((wanted[k] as { ref: string }).ref);
+      return;
+    }
+    const dead = (parsed.status !== 'active' && parsed.createdAt < now - PRUNE_GRACE_MS) || parsed.expiresAt < now - PRUNE_GRACE_MS;
+    if (paired && dead) stale.push((wanted[k] as { ref: string }).ref);
+    intents.push(parsed);
+  });
+  // Newest live claims first: a flood of old or planted refs must not push real intents past the cap.
+  const live = (i: Intent): number => (i.status === 'active' && i.expiresAt > now ? 1 : 0);
+  intents.sort((x, y) => live(y) - live(x) || y.createdAt - x.createdAt);
+  return { intents: intents.slice(0, MAX_REMOTE_INTENTS), stale };
+}
+
+/**
+ * Delete intent refs that nothing needs any more, locally and on origin, at most once per
+ * PRUNE_INTERVAL. Without this, every `ceasefire start` leaves a ref behind forever, the
+ * list grows without bound, and (before 0.3) the oldest 500 hid the newest. Only refs in
+ * refs/ceasefire/intents/ are touched, and only ones that are finished, long expired,
+ * malformed or oversized. Best-effort: never throws.
+ */
+export function pruneIntentRefs(cwd: string, now: number = Date.now()): number {
+  try {
+    if (process.env.CEASEFIRE_SYNC === '0' || findGitRoot(cwd) === null) return 0;
+    const stamp = stampPath(cwd)?.replace(/ceasefire-last-fetch$/, 'ceasefire-last-prune') ?? null;
+    if (stamp) {
+      try {
+        if (now - statSync(stamp).mtimeMs < PRUNE_INTERVAL_MS) return 0;
+      } catch {
+        /* never pruned */
+      }
+      try {
+        writeFileSync(stamp, `${new Date(now).toISOString()}\n`);
+      } catch {
+        /* read-only git dir: prune every time, still cheap */
+      }
+    }
+    const { stale } = readIntentRefs(cwd, now);
+    const refs = [...new Set(stale)].filter((r) => r.startsWith(REF_PREFIX)).slice(0, 200);
+    if (refs.length === 0) return 0;
+    gitResult(cwd, ['update-ref', '--stdin'], { input: refs.map((r) => `delete ${r}\n`).join('') });
+    if (hasRemote(cwd)) {
+      tryGit(cwd, ['push', '--quiet', 'origin', '--delete', ...refs], { env: NETWORK_ENV, timeoutMs: fetchTimeoutMs() });
+    }
+    return refs.length;
+  } catch {
+    return 0;
+  }
+}
+
+const PRUNE_INTERVAL_MS = 3_600_000;
 
 /**
  * Parse `git cat-file --batch` output: `<oid> <type> <size>\n<content>\n` per

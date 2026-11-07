@@ -3,16 +3,18 @@
  * point (src/cli.ts) only handles argv parsing and process exit codes.
  * Keeping commands pure-ish makes them testable without spawning.
  */
-import { userInfo } from 'node:os';
+import { hostname, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync, renameSync, appendFileSync } from 'node:fs';
 import { IntentStore, resolveDbPath, resolveStoreDir, openIntentStore } from '../intent/index.js';
 import { buildCollisionMatrix, intentCollisions } from '../forecast/forecast.js';
+import { relatedTips } from '../forecast/ancestry.js';
 import {
   canonicalizePath,
   PathOutsideRepoError,
   MAX_PATTERN_LENGTH,
   fileMatchesClaim,
+  pathsOverlap,
   isGlob,
   escapeGlob,
   type MatchOptions,
@@ -20,8 +22,8 @@ import {
 import { forecastWorktrees } from '../forecast/worktrees.js';
 import { deepForecast, type DeepRef } from '../forecast/deep.js';
 import { regenHint } from '../forecast/generated.js';
-import { findGitRoot, currentBranch, listLocalBranches, git, tryGit, CeasefireGitError } from '../forecast/git.js';
-import { broadcastIntent, fetchRemoteIntents } from './sync.js';
+import { findGitRoot, currentBranch, listLocalBranches, git, tryGit, CeasefireGitError, beginObjectQuarantine, resolveCommits } from '../forecast/git.js';
+import { broadcastIntent, fetchRemoteIntents, pruneIntentRefs } from './sync.js';
 import { AUTO_LEASE_TASK } from '../intent/index.js';
 import { statSync, utimesSync } from 'node:fs';
 import {
@@ -57,10 +59,11 @@ export function canonicalPaths(
   ctx: Ctx,
   inputs: string[],
   mode: 'files' | 'claims' = 'files',
-): { paths: string[] } | { error: string } {
+): { paths: string[]; ignored?: number } | { error: string } {
   const root = findGitRoot(ctx.cwd);
   const match = matchOptions(ctx.cwd, root);
   const out: string[] = [];
+  let ignored = 0;
   for (const raw of inputs) {
     if (raw.trim() === '') continue;
     if (raw.length > MAX_PATTERN_LENGTH) return { error: `path longer than ${MAX_PATTERN_LENGTH} characters` };
@@ -74,12 +77,17 @@ export function canonicalPaths(
       }
       throw e;
     }
+    // Git's own directory is never tracked content, and a `**` claim must not be "in contention" with it.
+    if (mode === 'files' && (match.ignoreCase ? p.toLowerCase() : p).split('/')[0] === '.git') {
+      ignored++;
+      continue;
+    }
     // A claim naming a real file whose name contains glob metacharacters
     // (Next.js `app/[id]/page.tsx`) is stored escaped, so it stays a literal.
     if (mode === 'claims' && root && isGlob(p) && existsSync(join(root, p))) p = escapeGlob(p);
     if (p && !out.includes(p)) out.push(p);
   }
-  return { paths: out };
+  return { paths: out, ...(ignored > 0 ? { ignored } : {}) };
 }
 
 /** Is this repository on a case-insensitive filesystem? (Windows root, git's core.ignorecase, or a `.GIT` probe.) */
@@ -123,18 +131,40 @@ export interface CommandResult {
 const HOOK_MARKER = '# installed by ceasefire init';
 const WORKFLOW_MARKER = '# installed by ceasefire init';
 
+/** True when no agent name was configured, so the name is guessed from the machine. */
+export function usesDefaultIdentity(): boolean {
+  return !process.env.CEASEFIRE_AGENT?.trim();
+}
+
+/**
+ * The agent's name: CEASEFIRE_AGENT, else `user@host`. The host part matters: every cloud
+ * container and CI runner has the same user ("root", "runner"), and an agent never collides with
+ * itself, so before 0.3.1 two such agents on different machines could never warn each other.
+ */
 export function currentAgent(): string {
   const fromEnv = process.env.CEASEFIRE_AGENT?.trim();
   if (fromEnv) return fromEnv;
+  let user = 'unknown';
   try {
-    return userInfo().username || 'unknown';
+    user = userInfo().username || 'unknown';
   } catch {
-    return 'unknown';
+    /* no passwd entry (container with an arbitrary uid) */
   }
+  let host = '';
+  try {
+    host = hostname().split('.')[0] ?? '';
+  } catch {
+    /* no hostname */
+  }
+  return (host ? `${user}@${host}` : user).slice(0, 120);
 }
 
 export function currentBranchName(cwd: string): string {
-  return process.env.CEASEFIRE_BRANCH?.trim() || currentBranch(cwd) || 'unknown';
+  const sha = () => {
+    const head = tryGit(cwd, ['rev-parse', '--short=8', 'HEAD']);
+    return head ? `detached@${head}` : 'unknown';
+  };
+  return process.env.CEASEFIRE_BRANCH?.trim() || currentBranch(cwd) || sha();
 }
 
 function openStore(cwd: string): IntentStore {
@@ -189,14 +219,20 @@ function err(message: string): CommandResult {
 /* check                                                               */
 /* ------------------------------------------------------------------ */
 
-export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): CommandResult {
+export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now(), opts: { claim?: boolean } = {}): CommandResult {
   if (files.length === 0) return err('usage: ceasefire check <file> [<file>...] [--json]');
+  // Outside a repository there is no shared ledger to consult. Saying "clear" would be a lie.
+  if (ctx.outsideRepo !== 'ignore' && !process.env.CEASEFIRE_DIR?.trim() && !findGitRoot(ctx.cwd)) return err('not a git repository: ceasefire checks files against the intents of this repository.');
   const canon = canonicalPaths(ctx, files);
   if ('error' in canon) return err(canon.error);
   const normalized = canon.paths;
   const match = matchOptions(ctx.cwd);
   if (normalized.length === 0) {
     if (ctx.outsideRepo === 'ignore') return { exitCode: EXIT_CLEAR, stdout: '' };
+    if (canon.ignored) {
+      const message = 'ceasefire: clear — .git internals are not tracked content; nothing to check.';
+      return { exitCode: EXIT_CLEAR, stdout: ctx.json ? JSON.stringify({ verdict: 'clear', files: [], contentions: [], message }, null, 2) + '\n' : message + '\n' };
+    }
     return err('usage: ceasefire check <file> [<file>...] [--json]');
   }
 
@@ -220,6 +256,7 @@ export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): C
     }
 
     if (contentions.length === 0) {
+      if (opts.claim) claimLease(ctx, normalized, now);
       const message = formatClearMessage(normalized);
       return {
         exitCode: EXIT_CLEAR,
@@ -232,6 +269,7 @@ export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): C
     if (process.env.CEASEFIRE_ALLOW_CONFLICT === '1') {
       const message = formatOverrideMessage(normalized);
       logOverride(ctx.cwd, agent, normalized, contentions);
+      if (opts.claim) claimLease(ctx, normalized, now);
       const report: CheckReport = { verdict: 'clear', files: normalized, contentions, overridden: true, strict: false };
       return {
         exitCode: EXIT_CLEAR,
@@ -242,6 +280,7 @@ export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now()): C
     }
 
     const strict = process.env.CEASEFIRE_STRICT === '1';
+    if (opts.claim && !strict) claimLease(ctx, normalized, now); // advisory: you may proceed, so you hold the files too
     const verdict: Verdict = strict ? 'blocked' : 'advisory';
     const report: CheckReport = { verdict, files: normalized, contentions, overridden: false, strict };
     const message = formatBlockedMessage(report);
@@ -344,6 +383,46 @@ export { AUTO_LEASE_TASK };
 /* start / done                                                        */
 /* ------------------------------------------------------------------ */
 
+/** A claim this wide is almost never meant: it stops every other agent from working. */
+const BROAD_CLAIM_FRACTION = 0.5;
+const BROAD_CLAIM_MIN_FILES = 20;
+
+/** Other agents' live intents that overlap `paths`, with the earlier claimant first. */
+function contendingIntents(cwd: string, store: IntentStore, paths: string[], mine: Intent, now: number): Array<Contention & { claimedFirst: boolean }> {
+  const match = matchOptions(cwd);
+  const out: Array<Contention & { claimedFirst: boolean }> = [];
+  for (const other of allActiveIntents(cwd, store, now)) {
+    if (other.agent === mine.agent || other.id === mine.id) continue;
+    const files = [...new Set(paths.filter((f) => other.paths.some((p) => pathsOverlap(f, p, match))))].sort();
+    if (files.length === 0) continue;
+    out.push({
+      holder: other.agent,
+      branch: other.branch,
+      intentId: other.id,
+      task: other.task,
+      expiresInMs: other.expiresAt - now,
+      files,
+      // Same tiebreak for both agents (earlier claim, then lower id), so they converge without negotiating.
+      claimedFirst: other.createdAt < mine.createdAt || (other.createdAt === mine.createdAt && other.id < mine.id),
+    });
+  }
+  return out;
+}
+
+/** How many tracked files do these claims cover? Null when git cannot say or the repo is small. */
+function broadClaim(cwd: string, paths: string[]): { covered: number; total: number } | null {
+  const root = findGitRoot(cwd);
+  if (!root) return null;
+  const listing = tryGit(root, ['ls-files', '-z']);
+  if (!listing) return null;
+  const files = listing.split('\0').filter(Boolean);
+  if (files.length < BROAD_CLAIM_MIN_FILES) return null;
+  const match = matchOptions(cwd, root);
+  let covered = 0;
+  for (const f of files) if (paths.some((p) => fileMatchesClaim(f, p, match))) covered++;
+  return covered >= BROAD_CLAIM_MIN_FILES && covered / files.length >= BROAD_CLAIM_FRACTION ? { covered, total: files.length } : null;
+}
+
 export function cmdStart(ctx: Ctx, task: string, paths: string[], ttlMs?: number): CommandResult {
   if (!task.trim()) return err('usage: ceasefire start "<task>" --paths <file> [<file>...]');
   const canon = canonicalPaths(ctx, paths, 'claims');
@@ -356,12 +435,37 @@ export function cmdStart(ctx: Ctx, task: string, paths: string[], ttlMs?: number
       ...(ttlMs !== undefined ? { ttlMs } : {}),
     });
     broadcastIntent(ctx.cwd, intent); // best-effort, never throws
+    pruneIntentRefs(ctx.cwd); // best-effort, at most hourly
+    const now = Date.now();
+    let contested: Array<Contention & { claimedFirst: boolean }> = [];
+    let broad: { covered: number; total: number } | null = null;
+    try {
+      contested = contendingIntents(ctx.cwd, store, canon.paths, intent, now);
+      broad = broadClaim(ctx.cwd, canon.paths);
+    } catch {
+      /* the heads-up is a courtesy; the claim itself is already published */
+    }
+    const warnings: string[] = [];
+    if (broad) warnings.push(`this claim covers ${broad.covered} of ${broad.total} tracked files; other agents will be told to stay away from most of the repository. Claim the directories you will actually edit.`);
+    if (usesDefaultIdentity()) warnings.push(`agent name defaulted to "${sanitizeDisplay(intent.agent)}". Agents that share a name never warn each other; set CEASEFIRE_AGENT to a different name per agent.`);
     const line =
       `ceasefire: intent ${intent.id.slice(0, 8)} published by "${sanitizeDisplay(intent.agent)}" on ${sanitizeDisplay(intent.branch)} ` +
       `(expires in ${formatDuration(intent.expiresAt - Date.now())}). Release with \`ceasefire done\`.`;
+    const text = [line];
+    if (contested.length > 0) {
+      text.push(`ceasefire: heads-up — ${contested.length} other intent(s) already hold some of these paths:`);
+      for (const c of contested) {
+        text.push(
+          `  "${sanitizeDisplay(c.holder)}" on ${sanitizeDisplay(c.branch)} (${c.intentId.slice(0, 8)}, "${sanitizeDisplay(c.task)}", expires in ${formatDuration(c.expiresInMs)}): ${c.files.slice(0, 5).map(sanitizeDisplay).join(', ')}${c.files.length > 5 ? ` … +${c.files.length - 5}` : ''}` +
+            (c.claimedFirst ? ' — claimed before you' : ' — claimed after you'),
+        );
+      }
+      text.push('  The earlier claim keeps priority. If theirs is earlier, pick other files (`ceasefire suggest`) or coordinate before editing.');
+    }
+    for (const w of warnings) text.push(`ceasefire: warning — ${w}`);
     return {
       exitCode: EXIT_CLEAR,
-      stdout: ctx.json ? JSON.stringify({ intent }, null, 2) + '\n' : line + '\n',
+      stdout: ctx.json ? JSON.stringify({ intent, contested, warnings }, null, 2) + '\n' : text.join('\n') + '\n',
     };
   } catch (e) {
     return err(e instanceof Error ? e.message.replace(/^ceasefire: /, '') : String(e));
@@ -471,12 +575,16 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
   let worktrees: Array<{ path: string; branch: string | null; label: string; dirty: boolean }> | undefined;
   const skipped: string[] = [];
   const store = openStore(ctx.cwd);
+  let endQuarantine: () => void = () => undefined;
   try {
     // --worktrees promises a read-only run: no fetch (which writes refs/ceasefire/* and FETCH_HEAD).
     const intents = allActiveIntents(ctx.cwd, store, now, { fetch: !opts.worktrees });
     const match = matchOptions(ctx.cwd, root);
     let collisions: Collision[];
     let deepRefs: DeepRef[] = [];
+    let related: ((a: string, b: string) => boolean) | undefined;
+    // From here on nothing is fetched: merge results and snapshots go to a temp object dir, not the repo.
+    endQuarantine = beginObjectQuarantine(ctx.cwd);
     if (opts.worktrees) {
       const wf = forecastWorktrees(ctx.cwd, { includeUntracked: opts.untracked ?? false });
       worktrees = wf.worktrees.map((w) => ({ path: w.path, branch: w.branch, label: w.label, dirty: w.dirty }));
@@ -489,20 +597,20 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
       }
       collisions = [...wf.collisions, ...intentCollisions(intents, now, match)];
       deepRefs = wf.worktrees.map((w) => ({ label: `${w.label} [worktree]`, oid: w.snapshot }));
+      related = relatedTips(ctx.cwd, deepRefs.map((d) => d.oid));
     } else {
       try {
         branches = listLocalBranches(ctx.cwd);
       } catch (e) {
         return err(e instanceof CeasefireGitError ? e.stderr : String(e));
       }
+      const tipOf = resolveCommits(ctx.cwd, branches);
+      related = relatedTips(ctx.cwd, [...tipOf.values()]);
       collisions = buildCollisionMatrix(ctx.cwd, branches, intents, now, (a, b, reason) => {
         skipped.push(`ceasefire: warning — could not forecast ${sanitizeDisplay(a)} <-> ${sanitizeDisplay(b)}: ${sanitizeDisplay(reason)}`);
-      }, match);
+      }, match, related);
       if (opts.overlap || opts.semantic || opts.neighbors) {
-        for (const b of branches) {
-          const oid = tryGit(ctx.cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${b}^{commit}`]);
-          if (oid) deepRefs.push({ label: b, oid });
-        }
+        for (const [label, oid] of tipOf) deepRefs.push({ label, oid });
       }
     }
     if (opts.overlap || opts.semantic || opts.neighbors) {
@@ -513,6 +621,7 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
         semantic: opts.semantic ?? false,
         neighbors: opts.neighbors ?? false,
         textual,
+        related,
       });
       collisions = [...collisions, ...deep.collisions];
       for (const n of deep.notes) skipped.push(`ceasefire: note — ${sanitizeDisplay(n)}`);
@@ -555,6 +664,7 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
           `  [${c.severity.toUpperCase()}${c.confidence ? `, ${c.confidence} confidence` : ''}${c.regenerable ? ', regenerable' : ''}] ${sanitizeDisplay(c.prA)} <-> ${sanitizeDisplay(c.prB)}\n` +
           `      files: ${c.files.map(sanitizeDisplay).join(', ')}` +
           (c.detail ? `\n      ${sanitizeDisplay(c.detail)}` : '') +
+          (c.yields ? `\n      claimed first keeps the files; ${sanitizeDisplay(c.yields)} should step aside` : '') +
           (c.hint ? `\n      fix: ${sanitizeDisplay(c.hint)}` : ''),
       ),
     ];
@@ -562,6 +672,7 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
   } catch (e) {
     return err(e instanceof CeasefireGitError ? e.stderr : String(e));
   } finally {
+    endQuarantine();
     store.close();
   }
 }
@@ -945,4 +1056,94 @@ export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean; st
       ? JSON.stringify({ initialized: true, notes }, null, 2) + '\n'
       : `ceasefire: initialized in ${root}\n${body}\n`,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* doctor                                                              */
+/* ------------------------------------------------------------------ */
+
+interface DoctorCheck {
+  name: string;
+  status: 'ok' | 'warn' | 'fail';
+  detail: string;
+}
+
+function onPath(bin: string): boolean {
+  const exts = process.platform === 'win32' ? ['', '.cmd', '.exe', '.bat'] : [''];
+  for (const dir of (process.env.PATH ?? '').split(process.platform === 'win32' ? ';' : ':')) {
+    if (!dir) continue;
+    for (const e of exts) if (existsSync(join(dir, bin + e))) return true;
+  }
+  return false;
+}
+
+/** `ceasefire doctor`: is this machine set up so that agents actually warn each other? */
+export function cmdDoctor(ctx: Ctx, now: number = Date.now()): CommandResult {
+  const checks: DoctorCheck[] = [];
+  const add = (name: string, status: DoctorCheck['status'], detail: string): void => {
+    checks.push({ name, status, detail });
+  };
+  const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number) as [number, number];
+  if (nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 13)) add('node', 'ok', `Node ${process.versions.node}`);
+  else add('node', 'fail', `Node ${process.versions.node}; ceasefire needs >= 22.13 for node:sqlite`);
+
+  const gv = tryGit(ctx.cwd, ['--version']);
+  const gm = gv ? /git version (\d+)\.(\d+)/.exec(gv) : null;
+  if (!gm) add('git', 'fail', 'git was not found on PATH');
+  else {
+    const v = Number(gm[1]) * 100 + Number(gm[2]);
+    if (v >= 240) add('git', 'ok', `${gv}: branch forecast, worktree forecast and batched merges all available`);
+    else if (v >= 238) add('git', 'warn', `${gv}: works, but 2.40+ batches merges (up to 12x faster on many branches)`);
+    else add('git', 'warn', `${gv}: worktree forecast needs 2.38+; branch forecast uses the legacy parser`);
+  }
+
+  const root = findGitRoot(ctx.cwd);
+  if (!root) {
+    add('repository', 'fail', 'not inside a git repository');
+  } else {
+    add('repository', 'ok', sanitizeDisplay(root));
+    try {
+      const store = openStore(ctx.cwd);
+      try {
+        const n = store.list({ status: 'active', now }).length;
+        add('ledger', 'ok', `${sanitizeDisplay(resolveStoreDir(ctx.cwd))} is writable; ${n} active local intent(s)`);
+      } finally {
+        store.close();
+      }
+    } catch (e) {
+      add('ledger', 'fail', `cannot open the intent ledger: ${sanitizeDisplay(e instanceof Error ? e.message : String(e))}`);
+    }
+    if (usesDefaultIdentity()) add('identity', 'warn', `CEASEFIRE_AGENT is not set; this agent is "${sanitizeDisplay(currentAgent())}". Two agents with the same name never warn each other.`);
+    else add('identity', 'ok', `agent "${sanitizeDisplay(currentAgent())}"`);
+
+    const settingsFile = join(root, '.claude', 'settings.json');
+    let hookText = '';
+    try {
+      hookText = existsSync(settingsFile) ? readFileSync(settingsFile, 'utf8') : '';
+    } catch {
+      /* unreadable settings are reported below as "not installed" */
+    }
+    if (hookText.includes(CLAUDE_HOOK_COMMAND)) {
+      add('claude hook', 'ok', `PreToolUse hook installed${hookText.includes('--strict') ? ' (strict)' : ' (advisory)'}${hookText.includes(CLAUDE_RELEASE_COMMAND) ? ', SessionEnd release hook installed' : '; SessionEnd release hook missing (run `ceasefire init --claude`)'}`);
+      if (!onPath('ceasefire')) add('PATH', 'warn', '`ceasefire` is not on PATH, so the Claude Code hook cannot run it; install globally (npm i -g) or edit the hook command');
+    } else add('claude hook', 'warn', 'not installed (run `ceasefire init --claude`); other agents only see claims made by `ceasefire start`/`check --claim`');
+
+    const gitDir = tryGit(ctx.cwd, ['rev-parse', '--absolute-git-dir']);
+    const pre = gitDir ? join(gitDir, 'hooks', 'pre-push') : '';
+    if (pre && existsSync(pre) && readFileSync(pre, 'utf8').includes(HOOK_MARKER)) add('pre-push hook', 'ok', 'installed (advisory)');
+    else add('pre-push hook', 'warn', 'not installed (run `ceasefire init`)');
+
+    if (process.env.CEASEFIRE_SYNC === '0') add('cross-machine sync', 'warn', 'disabled by CEASEFIRE_SYNC=0');
+    else if (!tryGit(ctx.cwd, ['remote', 'get-url', 'origin'])) add('cross-machine sync', 'warn', 'no remote named origin; intents are shared between worktrees of this clone only');
+    else {
+      const refs = (tryGit(ctx.cwd, ['for-each-ref', '--format=%(refname)', 'refs/ceasefire/intents/']) ?? '').split('\n').filter(Boolean).length;
+      add('cross-machine sync', 'ok', `origin configured; ${refs} intent ref(s) known locally (finished ones are pruned hourly)`);
+    }
+  }
+
+  const failed = checks.some((c) => c.status === 'fail');
+  if (ctx.json) return { exitCode: failed ? EXIT_ERROR : EXIT_CLEAR, stdout: JSON.stringify({ ok: !failed, checks }, null, 2) + '\n' };
+  const mark = { ok: 'ok  ', warn: 'warn', fail: 'FAIL' } as const;
+  const lines = checks.map((c) => `  [${mark[c.status]}] ${c.name}: ${c.detail}`);
+  return { exitCode: failed ? EXIT_ERROR : EXIT_CLEAR, stdout: `ceasefire doctor:\n${lines.join('\n')}\n` };
 }

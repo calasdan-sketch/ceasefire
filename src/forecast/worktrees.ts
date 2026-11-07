@@ -15,17 +15,20 @@
  *
  * then run the same `git merge-tree --write-tree` engine pairwise. Nothing
  * is checked out, no ref is created or moved, and the worktrees' real
- * indexes are never written. Snapshot objects are unreferenced and are
- * removed by git's normal garbage collection.
+ * indexes are never written. Callers that want a read-only run (the CLI
+ * does) wrap this in `withObjectQuarantine`, so snapshot blobs and commits
+ * live in a temporary directory that is deleted afterwards; without the
+ * wrapper they are unreferenced loose objects removed by git's normal
+ * garbage collection.
  *
- * Privacy note: with `includeUntracked`, the content of new non-ignored
- * files is written into the shared object store as loose objects (never
- * pushed — nothing references them). Keep secrets in .gitignore.
+ * Privacy note: with `includeUntracked`, new non-ignored files are hashed
+ * and read like a normal `git add -A`. Keep secrets in .gitignore.
  */
 import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, gitResult, CeasefireGitError } from './git.js';
+import { relatedTips } from './ancestry.js';
 import { gitSupportsWriteTree, mergeTreeConflictedFilesMany } from './forecast.js';
 import type { Collision } from '../types.js';
 
@@ -166,12 +169,13 @@ export function forecastWorktrees(cwd: string, opts: { includeUntracked?: boolea
     }
   }
   const collisions: Collision[] = [];
+  const related = relatedTips(cwd, snapshots.map((s) => s.snapshot));
   const jobs: Array<{ a: WorktreeSnapshot; b: WorktreeSnapshot }> = [];
   for (let i = 0; i < snapshots.length; i++) {
     for (let j = i + 1; j < snapshots.length; j++) {
       const a = snapshots[i] as WorktreeSnapshot;
       const b = snapshots[j] as WorktreeSnapshot;
-      if (a.snapshot !== b.snapshot) jobs.push({ a, b });
+      if (a.snapshot !== b.snapshot && !related(a.snapshot, b.snapshot)) jobs.push({ a, b });
     }
   }
   const results = mergeTreeConflictedFilesMany(

@@ -92,7 +92,7 @@ test('fetchRemoteIntents skips oversized and invalid intent blobs', () => {
       }).trim();
       git(b, ['update-ref', `refs/ceasefire/intents/${ref}`, blob]);
     };
-    const valid = { id: 'ok-1', agent: 'a', task: 't', branch: 'b', paths: ['x'], createdAt: 1, expiresAt: 9999999999999, status: 'active' };
+    const valid = { id: 'ok-1', agent: 'a', task: 't', branch: 'b', paths: ['x'], createdAt: Date.now(), expiresAt: Date.now() + 3_600_000, status: 'active' };
     // Oversized blob (100KB task) — must not bloat the local DB.
     plant('big', { ...valid, id: 'big-1', task: 'x'.repeat(100_000) });
     // Wrong field types.

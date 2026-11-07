@@ -58,7 +58,50 @@ export const CONFLICTS_TOOL: ToolDefinition = {
         type: 'string',
         description: 'Repository working directory. Defaults to the MCP server process cwd.',
       },
+      deep: { type: 'boolean', description: 'Also report removed exports still used by the other branch, and same-file races (`--deep`).' },
+      worktrees: { type: 'boolean', description: 'Forecast across git worktrees including uncommitted edits (`--worktrees`).' },
     },
+    required: [],
+    additionalProperties: false,
+  },
+};
+
+export const CLAIM_TOOL: ToolDefinition = {
+  name: 'ceasefire_claim',
+  description:
+    'Publish an advisory claim ("I am about to work on these paths") so other agents are warned before they edit them. ' +
+    'Mirrors `ceasefire start --json`. The result lists other agents that already hold some of the paths (`contested`); ' +
+    'the earlier claim keeps priority. Release with ceasefire_release when done. Claims expire by themselves (default 4h).',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task: { type: 'string', description: 'One line: what you are about to do.' },
+      paths: { type: 'array', items: { type: 'string' }, description: 'Files, directories or globs you will edit. Keep it narrow.' },
+      ttl: { type: 'string', description: 'Lifetime such as 30m, 2h or 1d (1 minute to 7 days). Default 4h.' },
+      cwd: { type: 'string', description: 'Repository working directory. Defaults to the MCP server process cwd.' },
+    },
+    required: ['task', 'paths'],
+    additionalProperties: false,
+  },
+};
+
+export const RELEASE_TOOL: ToolDefinition = {
+  name: 'ceasefire_release',
+  description: 'Release all of your own claims (`ceasefire done --all --json`). Call when you finish or abandon the work.',
+  inputSchema: {
+    type: 'object',
+    properties: { cwd: { type: 'string', description: 'Repository working directory. Defaults to the MCP server process cwd.' } },
+    required: [],
+    additionalProperties: false,
+  },
+};
+
+export const STATUS_TOOL: ToolDefinition = {
+  name: 'ceasefire_status',
+  description: 'Who is editing what right now, and which files are contested (`ceasefire status --json`). Reads the local ledger; no network.',
+  inputSchema: {
+    type: 'object',
+    properties: { cwd: { type: 'string', description: 'Repository working directory. Defaults to the MCP server process cwd.' } },
     required: [],
     additionalProperties: false,
   },
@@ -220,6 +263,10 @@ export async function runCheckTool(
 
 export interface ConflictsInput {
   cwd?: string;
+  /** Add removed-export-still-used and same-file-race findings (`--deep`). */
+  deep?: boolean;
+  /** Forecast across git worktrees including uncommitted edits (`--worktrees`). */
+  worktrees?: boolean;
 }
 
 /** Implements the `ceasefire_conflicts` tool. */
@@ -228,6 +275,34 @@ export async function runConflictsTool(
   input: ConflictsInput,
   opts: CeasefireRunOptions = {},
 ): Promise<McpToolResult> {
-  const res = await invokeCeasefireJson(bin, ['conflicts', '--json'], runOptions(opts, input.cwd));
+  const args = ['conflicts', '--json', ...(input.deep ? ['--deep'] : []), ...(input.worktrees ? ['--worktrees'] : [])];
+  const res = await invokeCeasefireJson(bin, args, runOptions(opts, input.cwd));
   return toMcpResult(res);
+}
+
+export interface ClaimInput {
+  task: string;
+  paths: string[];
+  ttl?: string;
+  cwd?: string;
+}
+
+/** Implements the `ceasefire_claim` tool. */
+export async function runClaimTool(bin: string, input: ClaimInput, opts: CeasefireRunOptions = {}): Promise<McpToolResult> {
+  if (input.task.trim() === '' || input.paths.length === 0) {
+    return { content: [{ type: 'text', text: 'ceasefire_claim needs a task and at least one path.' }], isError: true };
+  }
+  const args = ['start', '--json', ...(input.ttl ? ['--ttl', input.ttl] : []), '--paths', ...input.paths, '--', input.task];
+  const res = await invokeCeasefireJson(bin, args, runOptions(opts, input.cwd));
+  return toMcpResult(res);
+}
+
+/** Implements the `ceasefire_release` tool. */
+export async function runReleaseTool(bin: string, input: { cwd?: string }, opts: CeasefireRunOptions = {}): Promise<McpToolResult> {
+  return toMcpResult(await invokeCeasefireJson(bin, ['done', '--all', '--json'], runOptions(opts, input.cwd)));
+}
+
+/** Implements the `ceasefire_status` tool. */
+export async function runStatusTool(bin: string, input: { cwd?: string }, opts: CeasefireRunOptions = {}): Promise<McpToolResult> {
+  return toMcpResult(await invokeCeasefireJson(bin, ['status', '--json'], runOptions(opts, input.cwd)));
 }

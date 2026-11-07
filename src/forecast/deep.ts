@@ -34,6 +34,8 @@ export interface DeepOptions {
   neighbors?: boolean;
   /** Pairs already reported as textual conflicts: `${labelA}\0${labelB}` -> files. Overlap skips those files. */
   textual?: Map<string, string[]>;
+  /** Pairs whose tips are equal or ancestor/descendant (fast-forward): skipped without a merge-base. */
+  related?: (a: string, b: string) => boolean;
 }
 
 export interface DeepResult {
@@ -154,7 +156,7 @@ export function deepForecast(cwd: string, refs: DeepRef[], opts: DeepOptions = {
     for (let j = i + 1; j < refs.length; j++) {
       const X = refs[i] as DeepRef;
       const Y = refs[j] as DeepRef;
-      if (X.oid === Y.oid) continue;
+      if (X.oid === Y.oid || opts.related?.(X.oid, Y.oid)) continue;
       let base: string;
       try {
         base = git(cwd, ['merge-base', X.oid, Y.oid]);

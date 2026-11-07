@@ -15,7 +15,9 @@ const CLI = new URL('cli.js', root).pathname;
 const { textualCollisions } = await import(new URL('forecast/forecast.js', root));
 const { deepForecast } = await import(new URL('forecast/deep.js', root));
 const { IntentStore } = await import(new URL('intent/store.js', root));
-const out = { git: sh(process.cwd(), ['--version']), node: process.version, cpus: (await import('node:os')).cpus().length, forecast: [], hook: [], clash: null };
+const { mergeTreeBatch } = await import(new URL('forecast/batch.js', root));
+const { resolveCommits } = await import(new URL('forecast/git.js', root));
+const out = { git: sh(process.cwd(), ['--version']), node: process.version, cpus: (await import('node:os')).cpus().length, forecast: [], hook: [], clash: null, stale: null };
 
 const median = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
 const p95 = (a) => [...a].sort((x, y) => x - y)[Math.min(a.length - 1, Math.ceil(a.length * 0.95) - 1)];
@@ -51,6 +53,27 @@ for (const n of [10, 20, 40]) {
     deep.push(time(() => deepForecast(dir, refs, { overlap: true, semantic: true }))[0]);
   }
   out.forecast.push({ branches: n, pairs, serial_ms: Math.round(median(serial)), batched_ms: Math.round(median(batch)), speedup: +(median(serial) / median(batch)).toFixed(1), deep_ms: Math.round(median(deep)) });
+  cleanup(dir);
+}
+
+// repository with many stale branches (merged-but-not-deleted) plus 20 diverged agent branches,
+// and what a forecast leaves behind in the object store
+{
+  const STALE = 300, LIVE = 20;
+  const dir = fleet(LIVE);
+  for (let i = 0; i < STALE; i++) sh(dir, ['branch', `stale${i}`, 'main']);
+  const names = [...Array.from({ length: LIVE }, (_, i) => `agent${i + 1}`), ...Array.from({ length: STALE }, (_, i) => `stale${i}`)];
+  const count = () => Number(/^count: (\d+)/m.exec(sh(dir, ['count-objects', '-v']))[1]);
+  const [allMs] = time(() => textualCollisions(dir, names, undefined, { related: () => false }));
+  const [skipMs] = time(() => textualCollisions(dir, names));
+  const c0 = count();
+  textualCollisions(dir, names);
+  const quarantined = count() - c0;
+  const oids = resolveCommits(dir, names);
+  const c1 = count();
+  mergeTreeBatch(dir, (() => { const l = []; for (let i = 0; i < LIVE; i++) for (let j = i + 1; j < LIVE; j++) l.push([oids.get(names[i]), oids.get(names[j])]); return l; })());
+  const unquarantined = count() - c1;
+  out.stale = { branches: names.length, pairs: (names.length * (names.length - 1)) / 2, all_pairs_ms: Math.round(allMs), skip_related_ms: Math.round(skipMs), objects_written_now: quarantined, objects_written_before: unquarantined };
   cleanup(dir);
 }
 
@@ -107,6 +130,7 @@ else {
   console.log('all-pairs forecast (median of 3)');
   console.log('branches  pairs   per-pair-git   batched   speedup   --deep');
   for (const f of out.forecast) console.log(String(f.branches).padStart(8) + String(f.pairs).padStart(7) + (f.serial_ms + ' ms').padStart(14) + (f.batched_ms + ' ms').padStart(10) + (f.speedup + 'x').padStart(9) + (f.deep_ms + ' ms').padStart(9));
+  if (out.stale) console.log(`\nstale branches: ${out.stale.branches} branches (${out.stale.pairs} pairs), 20 of them diverged\n  every pair ${out.stale.all_pairs_ms} ms | fast-forward pairs skipped ${out.stale.skip_related_ms} ms\n  loose objects left in the repo by one forecast: ${out.stale.objects_written_now} now vs ${out.stale.objects_written_before} before (20 branches, merges written to the repo)`);
   console.log(`\neditor hook, whole process (${RUNS} runs)`);
   for (const h of out.hook) console.log('  ' + h.case.padEnd(40) + `p50 ${h.p50_ms} ms   p95 ${h.p95_ms} ms`);
   if (out.clash) console.log(`\nvs Clash ${out.clash.clash_version} on ${out.clash.worktrees} worktrees with uncommitted edits (median of 7):\n  clash status --json ${out.clash.clash_status_json_ms} ms | ceasefire conflicts --worktrees ${out.clash.ceasefire_worktrees_ms} ms | clash check ${out.clash.clash_check_ms} ms | ceasefire hook ${out.clash.ceasefire_hook_ms} ms`);

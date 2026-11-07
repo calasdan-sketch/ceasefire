@@ -1,13 +1,27 @@
 /** Shared fixtures for ceasefire tests: temp git repos with known branch topologies. */
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
+const created: string[] = [];
+// Fixtures used to pile up in /tmp (hundreds of directories after a few runs): remove them when the test process exits.
+process.on('exit', () => {
+  for (const d of created) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+});
+
 export function tempDir(prefix: string): string {
   // CEASEFIRE_TEST_TMP lets CI / crowded machines redirect fixture repos off /tmp.
   const base = process.env.CEASEFIRE_TEST_TMP?.trim() || tmpdir();
-  return mkdtempSync(join(base, prefix));
+  const dir = mkdtempSync(join(base, prefix));
+  created.push(dir);
+  return dir;
 }
 
 export function git(cwd: string, args: string[]): string {

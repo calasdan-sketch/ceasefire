@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   readActiveClaims,
@@ -12,11 +12,12 @@ import {
   defaultClaimDbPath,
   type ClaimlockClaim,
 } from '../../src/claimlock/adapter.js';
+import { tempDir } from '../helpers.js';
 
 const NOW = 1_800_000_000; // fixed "now" (unix seconds) for determinism
 
 function fixtureDb(): { path: string; claims: ClaimlockClaim[] } {
-  const dir = mkdtempSync(join(tmpdir(), 'ceasefire-claimlock-'));
+  const dir = tempDir('ceasefire-claimlock-');
   const path = join(dir, 'fleet.db');
   const db = new DatabaseSync(path);
   db.exec(`CREATE TABLE claims (
@@ -78,12 +79,12 @@ test('claim fields are mapped faithfully', () => {
 });
 
 test('missing database returns an empty list (claimlock simply not in use)', () => {
-  const missing = join(mkdtempSync(join(tmpdir(), 'ceasefire-cl-')), 'nope.db');
+  const missing = join(tempDir('ceasefire-cl-'), 'nope.db');
   assert.deepEqual(readActiveClaims(missing, NOW), []);
 });
 
 test('unreadable/corrupt database returns an empty list instead of throwing', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ceasefire-cl-'));
+  const dir = tempDir('ceasefire-cl-');
   const bad = join(dir, 'bad.db');
   writeFileSync(bad, 'this is not sqlite');
   assert.deepEqual(readActiveClaims(bad, NOW), []);

@@ -1,7 +1,7 @@
 /** MCP tools: ceasefire_check / ceasefire_conflicts via the ceasefire CLI subprocess. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -12,10 +12,11 @@ import {
   runCheckTool,
   runConflictsTool,
 } from '../../src/mcp/tools.js';
+import { tempDir } from '../helpers.js';
 
 /** A fake `ceasefire` bin: shell script echoing canned JSON with a chosen exit code. */
 function fakeBin(stdout: string, exitCode = 0, recordArgsTo?: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'ceasefire-bin-'));
+  const dir = tempDir('ceasefire-bin-');
   const bin = join(dir, 'ceasefire');
   const record = recordArgsTo !== undefined ? `echo "$@" > ${recordArgsTo}\n` : '';
   writeFileSync(bin, `#!/bin/sh\n${record}printf '%s' '${stdout.replace(/'/g, `'\\''`)}'\nexit ${exitCode}\n`);
@@ -42,7 +43,7 @@ test('invokeCeasefireJson parses --json output and reports the exit code', async
 });
 
 test('CLI arguments are forwarded verbatim (check --json -- <files>)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ceasefire-args-'));
+  const dir = tempDir('ceasefire-args-');
   const record = join(dir, 'args.txt');
   const bin = fakeBin('{}', 0, record);
   await invokeCeasefireJson(bin, ['check', '--json', '--', 'a b.ts', 'c.ts'], { timeoutMs: 5000 });
@@ -51,7 +52,7 @@ test('CLI arguments are forwarded verbatim (check --json -- <files>)', async () 
 });
 
 test('a .js binary (like dist/cli.js, no shebang) is launched through node', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ceasefire-jsbin-'));
+  const dir = tempDir('ceasefire-jsbin-');
   const bin = join(dir, 'cli.js');
   // NOTE: deliberately no shebang — mirrors tsc-compiled dist/cli.js
   writeFileSync(bin, `process.stdout.write(JSON.stringify({ verdict: 'clear' }));\n`);
@@ -75,7 +76,7 @@ test('missing binary reports a clear error instead of throwing', async () => {
 });
 
 test('timeout kills the process and reports timedOut', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ceasefire-slow-'));
+  const dir = tempDir('ceasefire-slow-');
   const bin = join(dir, 'ceasefire');
   writeFileSync(bin, '#!/bin/sh\nsleep 30\n');
   chmodSync(bin, 0o755);
@@ -117,7 +118,7 @@ test('runCheckTool requires at least one file', async () => {
 });
 
 test('runConflictsTool forwards cwd and surfaces failures as MCP errors', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ceasefire-repo-'));
+  const dir = tempDir('ceasefire-repo-');
   const bin = fakeBin('boom', 2);
   const out = await runConflictsTool(bin, { cwd: dir }, { timeoutMs: 5000 });
   assert.equal(out.isError, true);
