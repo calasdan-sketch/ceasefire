@@ -7,6 +7,14 @@
  * here *before* any module that imports node:sqlite is loaded. All other
  * warnings pass through unchanged.
  */
+import { nodeIsSupported } from './version.js';
+
+// package.json "engines" is only a warning for many installs: fail with a plain sentence instead of a stack trace about node:sqlite.
+if (!nodeIsSupported(process.versions.node)) {
+  process.stderr.write(`ceasefire: error: Node ${process.versions.node} is too old; ceasefire needs Node 22.13 or newer (it uses the built-in SQLite). Update Node, then run it again.\n`);
+  process.exit(1);
+}
+
 const originalEmitWarning = process.emitWarning.bind(process);
 process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
   const text = typeof warning === 'string' ? warning : warning?.message ?? '';

@@ -4,8 +4,9 @@
  * Keeping commands pure-ish makes them testable without spawning.
  */
 import { hostname, userInfo } from 'node:os';
-import { join } from 'node:path';
-import { mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync, renameSync, appendFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { minorLine } from '../version.js';
+import { mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync, renameSync, appendFileSync, copyFileSync, rmSync } from 'node:fs';
 import { IntentStore, resolveDbPath, resolveStoreDir, openIntentStore } from '../intent/index.js';
 import { buildCollisionMatrix, intentCollisions } from '../forecast/forecast.js';
 import { relatedTips } from '../forecast/ancestry.js';
@@ -22,8 +23,8 @@ import {
 import { forecastWorktrees } from '../forecast/worktrees.js';
 import { deepForecast, type DeepRef } from '../forecast/deep.js';
 import { regenHint } from '../forecast/generated.js';
-import { findGitRoot, currentBranch, listLocalBranches, git, tryGit, CeasefireGitError, beginObjectQuarantine, resolveCommits } from '../forecast/git.js';
-import { broadcastIntent, fetchRemoteIntents, pruneIntentRefs } from './sync.js';
+import { findGitRoot, currentBranch, listLocalBranches, git, tryGit, gitResult, CeasefireGitError, beginObjectQuarantine, resolveCommits } from '../forecast/git.js';
+import { broadcastIntent, fetchRemoteIntents, pruneIntentRefs, syncEnabled, MAX_REMOTE_TASK_CHARS, MAX_REMOTE_PATHS, MAX_REMOTE_BLOB_BYTES } from './sync.js';
 import { AUTO_LEASE_TASK } from '../intent/index.js';
 import { statSync, utimesSync } from 'node:fs';
 import {
@@ -167,6 +168,18 @@ export function currentBranchName(cwd: string): string {
   return process.env.CEASEFIRE_BRANCH?.trim() || currentBranch(cwd) || sha();
 }
 
+/**
+ * "not a git repository", unless git says why: a checkout owned by another user is refused by git
+ * ("dubious ownership"; common in Docker and CI) and must not be reported as "no repository".
+ */
+export function notRepoMessage(cwd: string, then: string): string {
+  const r = gitResult(cwd, ['rev-parse', '--show-toplevel']);
+  if (/dubious ownership/i.test(r.stderr)) {
+    return `git refuses to open this repository because it belongs to another user ("dubious ownership"). If you trust it, run: git config --global --add safe.directory "${cwd}"`;
+  }
+  return `not a git repository. ${then}`;
+}
+
 function openStore(cwd: string): IntentStore {
   // Resilient open: a corrupt intents.db is quarantined and recreated
   // instead of failing every command (see openIntentStore).
@@ -222,7 +235,7 @@ function err(message: string): CommandResult {
 export function cmdCheck(ctx: Ctx, files: string[], now: number = Date.now(), opts: { claim?: boolean } = {}): CommandResult {
   if (files.length === 0) return err('usage: ceasefire check <file> [<file>...] [--json]');
   // Outside a repository there is no shared ledger to consult. Saying "clear" would be a lie.
-  if (ctx.outsideRepo !== 'ignore' && !process.env.CEASEFIRE_DIR?.trim() && !findGitRoot(ctx.cwd)) return err('not a git repository: ceasefire checks files against the intents of this repository.');
+  if (ctx.outsideRepo !== 'ignore' && !process.env.CEASEFIRE_DIR?.trim() && !findGitRoot(ctx.cwd)) return err(notRepoMessage(ctx.cwd, 'ceasefire checks files against the intents of this repository.'));
   const canon = canonicalPaths(ctx, files);
   if ('error' in canon) return err(canon.error);
   const normalized = canon.paths;
@@ -441,7 +454,7 @@ export function cmdStart(ctx: Ctx, task: string, paths: string[], ttlMs?: number
       branch: currentBranchName(ctx.cwd),
       ...(ttlMs !== undefined ? { ttlMs } : {}),
     });
-    broadcastIntent(ctx.cwd, intent); // best-effort, never throws
+    const shared = broadcastIntent(ctx.cwd, intent); // best-effort, never throws
     pruneIntentRefs(ctx.cwd); // best-effort, at most hourly
     const now = Date.now();
     let contested: Array<Contention & { claimedFirst: boolean }> = [];
@@ -454,6 +467,11 @@ export function cmdStart(ctx: Ctx, task: string, paths: string[], ttlMs?: number
     }
     const warnings: string[] = [];
     if (broad) warnings.push(`this claim covers ${broad.covered} of ${broad.total} tracked files; other agents will be told to stay away from most of the repository. Claim the directories you will actually edit.`);
+    if (syncEnabled(ctx.cwd)) {
+      const tooBig = intent.task.length > MAX_REMOTE_TASK_CHARS || intent.paths.length > MAX_REMOTE_PATHS || Buffer.byteLength(JSON.stringify(intent)) > MAX_REMOTE_BLOB_BYTES;
+      if (tooBig) warnings.push('this claim is too large to share: other machines ignore it. Use a shorter task text and claim directories or globs instead of many single files.');
+      else if (!shared) warnings.push('could not reach "origin": this intent is visible on this machine only. Check your network or credentials, then run `ceasefire doctor`.');
+    }
     if (usesDefaultIdentity()) warnings.push(`agent name defaulted to "${sanitizeDisplay(intent.agent)}". Agents that share a name never warn each other; set CEASEFIRE_AGENT to a different name per agent.`);
     const line =
       `ceasefire: intent ${intent.id.slice(0, 8)} published by "${sanitizeDisplay(intent.agent)}" on ${sanitizeDisplay(intent.branch)} ` +
@@ -579,12 +597,19 @@ export function annotateRegenerable(collisions: Collision[]): Collision[] {
 
 export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: ConflictsOptions = {}): CommandResult {
   const root = findGitRoot(ctx.cwd);
-  if (!root) return err('not a git repository. `ceasefire conflicts` forecasts branch collisions with git merge-tree.');
+  if (!root) return err(notRepoMessage(ctx.cwd, '`ceasefire conflicts` forecasts branch collisions with git merge-tree.'));
   if (opts.untracked && !opts.worktrees) return err('--untracked only applies together with --worktrees');
   let branches: string[] = [];
   let worktrees: Array<{ path: string; branch: string | null; label: string; dirty: boolean }> | undefined;
   const skipped: string[] = [];
-  const store = openStore(ctx.cwd);
+  let store: IntentStore;
+  try {
+    store = openStore(ctx.cwd);
+  } catch (e) {
+    // The branch forecast does not need the ledger: report git-only results instead of failing (read-only checkouts, CI).
+    skipped.push(`ceasefire: warning: ${e instanceof Error ? e.message : String(e)} Showing branch collisions only; agent intents are not included.`);
+    store = new IntentStore(':memory:');
+  }
   let endQuarantine: () => void = () => undefined;
   try {
     // --worktrees promises a read-only run: no fetch (which writes refs/ceasefire/* and FETCH_HEAD).
@@ -726,7 +751,7 @@ export function cmdList(ctx: Ctx, now: number = Date.now()): CommandResult {
  * status line that refreshes every few seconds.
  */
 export function cmdStatus(ctx: Ctx, opts: { oneline?: boolean } = {}, now: number = Date.now()): CommandResult {
-  if (!findGitRoot(ctx.cwd)) return err('not a git repository.');
+  if (!findGitRoot(ctx.cwd)) return err(notRepoMessage(ctx.cwd, 'ceasefire suggest needs a repository.'));
   const store = openStore(ctx.cwd);
   try {
     const intents = allActiveIntents(ctx.cwd, store, now, { fetch: false });
@@ -917,8 +942,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npx ceasefire@latest conflicts --json
+      - run: npx --yes ceasefire@${minorLine()} conflicts --json
 `;
+
+/** rename over an existing file; on Windows a scanner or editor holding `to` open makes rename fail (EPERM/EBUSY/EACCES), so fall back to copy. */
+function replaceFile(from: string, to: string): void {
+  try {
+    renameSync(from, to);
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw e;
+    copyFileSync(from, to);
+    rmSync(from, { force: true });
+  }
+}
 
 /** The PreToolUse entry `ceasefire init --claude` adds to .claude/settings.json. */
 export const CLAUDE_HOOK_COMMAND = 'ceasefire hook claude';
@@ -986,7 +1023,7 @@ export function installClaudeHook(root: string, opts: { strict?: boolean; status
   mkdirSync(dir, { recursive: true });
   const tmp = `${file}.ceasefire-tmp`;
   writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n');
-  renameSync(tmp, file);
+  replaceFile(tmp, file);
   return {
     ok: true,
     note:
@@ -997,7 +1034,7 @@ export function installClaudeHook(root: string, opts: { strict?: boolean; status
 
 export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean; statusline?: boolean } = {}): CommandResult {
   const root = findGitRoot(ctx.cwd);
-  if (!root) return err('not a git repository. Run `ceasefire init` inside a git checkout.');
+  if (!root) return err(notRepoMessage(ctx.cwd, 'Run `ceasefire init` inside a git checkout.'));
   let gitDir: string;
   try {
     gitDir = git(ctx.cwd, ['rev-parse', '--absolute-git-dir']);
@@ -1007,22 +1044,30 @@ export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean; st
 
   const notes: string[] = [];
 
-  // Pre-push hook (advisory, never blocks).
-  const hookPath = join(gitDir, 'hooks', 'pre-push');
-  mkdirSync(join(gitDir, 'hooks'), { recursive: true });
-  if (existsSync(hookPath)) {
-    const existing = readFileSync(hookPath, 'utf8');
-    if (!existing.includes(HOOK_MARKER)) {
-      const backup = `${hookPath}.ceasefire-backup`;
-      renameSync(hookPath, backup);
-      notes.push(`existing pre-push hook backed up to ${backup}`);
-    } else {
-      notes.push('pre-push hook already installed by ceasefire; refreshed');
+  // Pre-push hook (advisory, never blocks). `git rev-parse --git-path hooks` is the directory git itself will read:
+  // the shared hooks folder even from a linked worktree (whose own git dir has no hooks), or core.hooksPath.
+  const hooksDir = resolve(ctx.cwd, tryGit(ctx.cwd, ['rev-parse', '--git-path', 'hooks']) ?? join(gitDir, 'hooks'));
+  const customHooks = tryGit(ctx.cwd, ['config', '--get', 'core.hooksPath']);
+  if (customHooks) {
+    // A hook manager (husky, lefthook, ...) owns this folder, often inside the tracked tree: do not write there.
+    notes.push(`pre-push hook NOT installed: git is configured with core.hooksPath (${customHooks}); add \`ceasefire conflicts\` to your hook manager, or run it in CI`);
+  } else {
+    const hookPath = join(hooksDir, 'pre-push');
+    mkdirSync(hooksDir, { recursive: true });
+    if (existsSync(hookPath)) {
+      const existing = readFileSync(hookPath, 'utf8');
+      if (!existing.includes(HOOK_MARKER)) {
+        const backup = `${hookPath}.ceasefire-backup`;
+        renameSync(hookPath, backup);
+        notes.push(`existing pre-push hook backed up to ${backup}`);
+      } else {
+        notes.push('pre-push hook already installed by ceasefire; refreshed');
+      }
     }
+    writeFileSync(hookPath, PRE_PUSH_HOOK, { mode: 0o755 });
+    chmodSync(hookPath, 0o755);
+    notes.push(`pre-push hook installed at ${hookPath} (advisory only, never blocks)`);
   }
-  writeFileSync(hookPath, PRE_PUSH_HOOK, { mode: 0o755 });
-  chmodSync(hookPath, 0o755);
-  notes.push(`pre-push hook installed at ${hookPath} (advisory only, never blocks)`);
 
   // GitHub workflow stub.
   const wfPath = join(root, '.github', 'workflows', 'ceasefire.yml');
@@ -1039,22 +1084,8 @@ export function cmdInit(ctx: Ctx, opts: { claude?: boolean; strict?: boolean; st
     notes.push(`workflow stub written to ${wfPath}`);
   }
 
-  // The intent DB is local agent state (plus WAL sidecars) — it must never
-  // be committed. Ignore the whole .ceasefire/ dir.
-  const giPath = join(root, '.gitignore');
-  const giLine = '.ceasefire/';
-  if (existsSync(giPath)) {
-    const lines = readFileSync(giPath, 'utf8').split('\n').map((l) => l.trim());
-    if (!lines.includes(giLine) && !lines.includes('.ceasefire')) {
-      appendFileSync(giPath, `\n${giLine}\n`);
-      notes.push('added .ceasefire/ to .gitignore (intent DB is local state, never committed)');
-    } else {
-      notes.push('.gitignore already covers .ceasefire/');
-    }
-  } else {
-    writeFileSync(giPath, `${giLine}\n`);
-    notes.push('created .gitignore ignoring .ceasefire/ (intent DB is local state, never committed)');
-  }
+  // The intent ledger lives inside .git (<git common dir>/ceasefire), so nothing needs ignoring and .gitignore is left alone.
+  // (0.3.0 pre-release builds appended `.ceasefire/` here; that was only needed by 0.1-0.2, which kept the ledger in the work tree.)
 
   if (opts.claude) notes.push(installClaudeHook(root, { strict: opts.strict ?? false, statusline: opts.statusline ?? false }).note);
 

@@ -50,11 +50,20 @@ export function isCorruptionError(e: unknown): boolean {
   return primary === SQLITE_CORRUPT || primary === SQLITE_NOTADB;
 }
 
+/** SQLITE_BUSY (5) and SQLITE_LOCKED (6): another process holds the ledger. */
+function isLockError(cause: unknown): boolean {
+  const code = typeof cause === 'object' && cause !== null ? (cause as { errcode?: unknown }).errcode : undefined;
+  return typeof code === 'number' && ((code & 0xff) === 5 || (code & 0xff) === 6);
+}
+
 export class IntentStoreBusyError extends Error {
   constructor(dbPath: string, cause: unknown) {
+    const why = cause instanceof Error ? cause.message : String(cause);
     super(
-      `the intent store ${dbPath} is busy or unavailable (${cause instanceof Error ? cause.message : String(cause)}); ` +
-        'another ceasefire process may hold a long lock. Nothing was changed — retry in a moment.',
+      isLockError(cause) || /written recently/.test(why)
+        ? `the intent store ${dbPath} is busy (${why}); another ceasefire process may hold a long lock. Nothing was changed — retry in a moment.`
+        : `cannot use the intent store ${dbPath} (${why}). The folder or file may be read-only or missing permissions; ` +
+            'make it writable or point CEASEFIRE_DIR at a writable folder. Nothing was changed.',
     );
     this.name = 'IntentStoreBusyError';
   }

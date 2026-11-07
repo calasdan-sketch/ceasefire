@@ -29,10 +29,14 @@ const CLOCK_SKEW_MS = 86_400_000;
 const PRUNE_GRACE_MS = 86_400_000;
 /** Upper bound on a single intent blob — the local DB must not bloat. */
 const MAX_INTENT_BLOB_BYTES = 64 * 1024;
+/** What another machine will accept (see isValidRemoteIntent); `start` warns when a claim exceeds it. */
+export const MAX_REMOTE_TASK_CHARS = 10_000;
+export const MAX_REMOTE_PATHS = 1000;
+export const MAX_REMOTE_BLOB_BYTES = MAX_INTENT_BLOB_BYTES;
 /** Intent ids travel inside git ref names; keep them ref-safe. */
 const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 
-function syncEnabled(cwd: string): boolean {
+export function syncEnabled(cwd: string): boolean {
   if (process.env.CEASEFIRE_SYNC === '0') return false;
   return findGitRoot(cwd) !== null && hasRemote(cwd);
 }

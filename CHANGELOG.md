@@ -2,6 +2,38 @@
 
 ## 0.3.0 — unreleased (expert rounds 2 and 3)
 
+### Round 4 (what a stranger gets from `npm i`)
+
+Panel: first-time user on a clean prefix (path with a space), release/packaging engineer, supply-chain reviewer,
+Windows/CI reviewer (static), hostile-input tester, docs/DX reviewer. Details and the scored idea list: `docs/ROUND4.md`.
+
+#### Fixed
+- **The package had no LICENSE file** although it declares MIT; **no author, repository, homepage, bugs or keywords**;
+  27 source maps (pointing at sources that are not shipped) went into the tarball. Now: LICENSE, full metadata,
+  `exports` limited to `package.json` (the package is a CLI; `import "ceasefire"` fails with a clear error instead of a
+  missing-file error), maps and typings left out. `prepack` rebuilds `dist/` from scratch, so `npm pack` and
+  `npm publish` can no longer ship a stale build.
+- **`git diff --name-only | ceasefire check --stdin` said "clear" for non-ASCII file names** (git writes them quoted as
+  `"caf\303\251.ts"`). Names are now decoded; README uses `-z`.
+- **`ceasefire init` in a linked worktree installed the pre-push hook where git never reads it** and still reported
+  success. It now uses the folder git reads, and does not write into a `core.hooksPath` hook manager folder (it says so).
+- `init` no longer appends `.ceasefire/` to your `.gitignore` (the ledger has lived inside `.git` since 0.3).
+- The generated GitHub workflow ran `npx ceasefire@latest`; it now pins the minor line (`ceasefire@0.3`), so a future
+  release cannot change your CI by surprise.
+- A repository owned by another user (git "dubious ownership") was reported as "not a git repository".
+- A read-only or unwritable ledger was reported as "busy, another process may hold a long lock". It now says what is
+  wrong; `conflicts` carries on with branch results and a warning.
+- `start` printed "published" even when `origin` could not be reached or the claim was too big for other machines to
+  accept; it now says so.
+- `--help` listed two of the five MCP tools. Node older than 22.13 now gets one plain sentence instead of a stack trace.
+- `npm audit` findings in transitive dependencies (`body-parser`, `fast-uri`, reached only through the MCP SDK's HTTP
+  code, which ceasefire does not use) are cleared in the lockfile; installs resolve fresh ranges anyway.
+
+#### Not done / not tested
+- Windows, macOS, Node 22.13 and Node 24 were not run (see `docs/ROUND4.md`).
+- `CEASEFIRE_DIR` pointing into `/proc` hangs inside Node's recursive `mkdir`; not fixed (needs a deliberate bad value).
+- The test suite takes about five minutes.
+
 ### Round 3
 
 Panel: platform engineer (8 agents, large repo), attacker (planted refs, hostile names), git-internals/performance

@@ -36,16 +36,22 @@ No daemon. No lock server. Advisory by default, strict opt-in.
 ## Quick start (60 seconds)
 
 ```sh
-git clone https://github.com/calasdan-sketch/ceasefire && cd ceasefire
-npm ci && npm run build && npm link   # puts `ceasefire` on PATH (0.3 is not on npm yet, see below)
+npm i -g ceasefire                 # puts `ceasefire` on PATH (needs Node >= 22.13 and git)
 cd your-repo
 export CEASEFIRE_AGENT=my-agent    # a different name per agent; agents that share a name never warn each other
 ceasefire init --claude            # pre-push hook + workflow stub + Claude Code hook
 ceasefire doctor                   # what is installed, what is missing
 ```
 
-The npm name `ceasefire` currently resolves to version 0.0.1 (checked 2026-11-07), not this code, so
-`npm i -g ceasefire` would not give you the features described here until 0.3 is published.
+**Version note (checked 2026-11-07).** The npm name `ceasefire` resolves to 0.0.1, an early placeholder without
+this code. Everything below describes 0.3.0. Until 0.3.0 is published, install from a checkout instead of `npm i -g`:
+
+```sh
+git clone https://github.com/calasdan-sketch/ceasefire && cd ceasefire
+npm ci && npm run build && npm link   # `npm link` puts `ceasefire` on PATH
+```
+
+Without installing anything: `npx ceasefire@0.3 doctor` (once published).
 
 Synthetic demo (two agents, made-up names):
 
@@ -99,8 +105,8 @@ ceasefire done
 
 | Command | Effect |
 |---|---|
-| `ceasefire init [--claude] [--statusline]` | Installs advisory pre-push hook + `.github/workflows/ceasefire.yml` stub; `--claude` also merges the PreToolUse (auto-lease) and SessionEnd hooks into `.claude/settings.json`; `--statusline` fills an empty `statusLine` slot |
-| `ceasefire check <files...> [--json] [--claim] [--stdin]` | Pre-edit collision check. `--claim` also holds the files (auto-lease, for agents without the Claude hook); `--stdin` reads more names from a pipe (`git diff --name-only \| ceasefire check --stdin`). `.git/` paths are ignored; outside a repository it is an error, not "clear" |
+| `ceasefire init [--claude] [--statusline]` | Installs advisory pre-push hook (in the folder git really reads, also from a linked worktree; skipped with a note when `core.hooksPath` is set) + `.github/workflows/ceasefire.yml` stub pinned to `ceasefire@<minor>`; never edits `.gitignore`; `--claude` also merges the PreToolUse (auto-lease) and SessionEnd hooks into `.claude/settings.json`; `--statusline` fills an empty `statusLine` slot |
+| `ceasefire check <files...> [--json] [--claim] [--stdin]` | Pre-edit collision check. `--claim` also holds the files (auto-lease, for agents without the Claude hook); `--stdin` reads more names from a pipe (`git diff --name-only -z \| ceasefire check --stdin`; with `-z` names are exact, without it git quotes non-ASCII names and ceasefire decodes that quoting). `.git/` paths are ignored; outside a repository it is an error, not "clear" |
 | `ceasefire start "<task>" --paths <...> [--ttl 30m]` | Publish an intent (default 4h TTL, 1m–7d; broadcast via git refs). Paths may be files, directories or globs. Tells you who already holds some of the paths and who claimed first, and warns when the claim covers most of the repository or your agent name is only a guess |
 | `ceasefire done [--id <id>]` | Complete your active intent |
 | `ceasefire list [--json]` | Active intents from every agent |
@@ -272,25 +278,29 @@ repository, median of 3:
 
 | all-pairs forecast | 10 branches (45 pairs) | 20 (190) | 40 (780) |
 |---|---|---|---|
-| one git process per pair | 222 ms | 999 ms | 4203 ms |
-| batched `merge-tree --stdin` (0.3, writes nothing into the repo) | 52 ms | 196 ms | 805 ms |
-| speed-up | 4.3x | 5.1x | 5.2x |
-| `--deep` | 316 ms | 1013 ms | 3734 ms |
-| batched, merge results written into the repo (what 0.3 did before round 3) | 30 ms | 160 ms | 542 ms |
+| one git process per pair | 197 ms | 845 ms | 3509 ms |
+| batched `merge-tree --stdin` (0.3, writes nothing into the repo) | 40 ms | 99 ms | 373 ms |
+| speed-up | 5x | 8.6x | 9.4x |
+| `--deep` | 282 ms | 971 ms | 3644 ms |
+| batched, merge results written into the repo (what 0.3 did before round 3) | 16 ms | 55 ms | 211 ms |
+
+(Round 4 re-run on a quieter machine: every row is faster than the round 3 run, which measured 52 / 196 / 805 ms for the
+batched row. The ratios, not the milliseconds, are the stable part.)
 
 Correction to the first 0.3 numbers (43 / 88 / 249 ms, 4.5x / 9.2x / 12.7x): that benchmark repeated the same
 forecast on one repository, and git skips writing objects it already has, so every repeat was warm. Cold runs are
 what a real `conflicts` call sees. Keeping the repository clean costs a fixed ~20 ms of extra git processes (finding the object
-directory, resolving tips, deciding about the ancestry walk) and, at 40 branches, is within the noise of writing into the repo
-(a separate three-way comparison on fresh repositories gave 517-681 ms in the repo and 627-783 ms quarantined).
+directory, resolving tips, deciding about the ancestry walk) plus a share that grows with the number of pairs: in the
+round 4 run, 373 ms quarantined against 211 ms written into the repo at 40 branches. Round 3 had called that difference
+"within the noise"; the table says otherwise, so treat it as a real cost of leaving no objects behind.
 
 Many stale branches (`bench/latency.mjs`, 300 branches that sit on `main` plus 20 diverged agent branches, 51,040 pairs):
-every pair 2233 ms, fast-forward pairs skipped 257 ms. One forecast of the 20 diverged branches added 400 loose objects
+every pair 1855 ms, fast-forward pairs skipped 137 ms. One forecast of the 20 diverged branches added 400 loose objects
 to the repository before round 3 and adds 0 now. (Separately, by hand: `conflicts` on 600 branches that all point at one commit took 22.9 s
 and now takes about 0.2 s.)
 
-Editor hook, whole process as Claude Code runs it (p50 / p95 of 25): node start-up alone 28/34 ms;
-check only 75/90 ms; with auto-lease 86/101 ms; with 200 intents in the ledger 86/93 ms.
+Editor hook, whole process as Claude Code runs it (p50 / p95 of 25): node start-up alone 28/42 ms;
+check only 77/125 ms; with auto-lease 90/139 ms; with 200 intents in the ledger 88/111 ms.
 
 Against Clash 0.2.0 (built from crates.io; measured in round 2, not re-run in round 3) on the same 10 worktrees with uncommitted edits (median
 of 7): `clash status --json` 54 ms vs `ceasefire conflicts --worktrees` 274 ms; `clash check` 29 ms vs
@@ -320,7 +330,8 @@ the `CEASEFIRE_ALLOW_CONFLICT=1` override.
 ## How it compares
 
 Competitor statements come from each project's own README (linked; Clash's and moire's READMEs were
-re-read on 2026-11-07, no new claims affected this table). The only competitor I ran is Clash 0.2.0 (timings
+re-read on 2026-11-07; in round 4 GitHub was not reachable from the test machine, so they were not re-read again. The crates.io
+record of `clash-sh` showed its last update on 2026-02-08). The only competitor I ran is Clash 0.2.0 (timings
 above, measured in round 2; not re-run in round 3); everything else is unverified by me.
 
 | | ceasefire | [Clash](https://github.com/clash-sh/clash) | [moire](https://github.com/jamescazzetta/moire) | [AGNT-LOCK](https://github.com/codewithriza/AGNT-LOCK) | [agent-claim-mcp](https://github.com/vk0dev/agent-claim-mcp) | [mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail) |
@@ -380,6 +391,16 @@ Honest limits:
   The full PR-matrix Action lives in `src/github/` and is not yet published as a
   root-level `action.yml`, so `uses: calasdan-sketch/ceasefire@v1` does not work yet.
 - Agent identity is self-asserted (see below).
+- **Windows has never been run.** Path handling, the `;` list separator for git object directories, CRLF input and
+  `rename` over open files were reviewed in code and covered by path-fuzz tests only. If it misbehaves on Windows,
+  that is a bug to report, not a documented limit.
+- Only Node 22.23 was run for this release; 22.13 (the stated minimum) and Node 24 are untested here. Older Node
+  prints one plain sentence and exits 1.
+- A checkout the current user does not own is refused by git ("dubious ownership", common in Docker); ceasefire now
+  says so and prints the `safe.directory` command instead of "not a git repository".
+- On a read-only checkout, `conflicts` still forecasts branches (with a warning that intents are missing);
+  `check`, `start`, `list`, `status` stop with a plain message, because they need the ledger.
+- A claim of more than 1,000 paths or 64 KB is kept locally but other machines ignore it (`start` now says so).
 
 ## Trust model
 
@@ -415,7 +436,7 @@ Ceasefire coordinates **trusted-but-uncoordinated** agents. Know the boundaries:
 ## Dev
 
 ```sh
-npm test    # tsc + node:test, 251 tests (hermetic: ignores GITHUB_TOKEN, stays out of the parent repo)
+npm test    # tsc + node:test, 265 tests (hermetic: ignores GITHUB_TOKEN, stays out of the parent repo)
 npx tsc     # build -> dist/
 npm run bench   # accuracy (40 histories, as quoted above) + latency benchmarks (about 6 minutes)
 ```

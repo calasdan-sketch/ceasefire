@@ -27,6 +27,7 @@
     "test/hook.test.ts",
     "test/review.test.ts",
     "test/expert2.test.ts",
-    "test/round3.test.ts"
+    "test/round3.test.ts",
+    "test/round4.test.ts"
   ]
 }

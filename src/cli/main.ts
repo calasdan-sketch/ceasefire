@@ -3,23 +3,12 @@
  * after it installs the warning filter, so node:sqlite's experimental
  * warning never pollutes agent-facing output.
  */
-import { readFileSync } from 'node:fs';
+import { VERSION } from '../version.js';
+import { unquoteGitPath } from './gitquote.js';
 import { cmdCheck, cmdConflicts, cmdDoctor, cmdDone, cmdInit, cmdList, cmdStart, cmdStatus, cmdSuggest, parseTtl, type Ctx } from './commands.js';
 import { runClaudeHook, runReleaseHook, MAX_HOOK_INPUT_BYTES } from './hook.js';
 import { EXIT_ERROR } from '../types.js';
 
-function version(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
-      version?: string;
-    };
-    return pkg.version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
-
-const VERSION = version();
 const MAX_STDIN_PATH_BYTES = 4 * 1024 * 1024;
 
 interface Parsed {
@@ -167,7 +156,8 @@ Usage:
                                           Claude Code PreToolUse hook (reads the event on stdin);
                                           --claim keeps a 15-minute sliding lease on every file the session edits
   ceasefire hook release                  Claude Code SessionEnd hook: free this session's leases
-  ceasefire --mcp                         start MCP stdio server (ceasefire_check, ceasefire_conflicts)
+  ceasefire --mcp                         start MCP stdio server: ceasefire_check, ceasefire_conflicts,
+                                          ceasefire_claim, ceasefire_release, ceasefire_status
 
 Exit codes: 0 clear · 1 error · 2 advisory · 3 hard block (CEASEFIRE_STRICT=1)
 Env: CEASEFIRE_JSON=1 · CEASEFIRE_STRICT=1 · CEASEFIRE_ALLOW_CONFLICT=1 · CEASEFIRE_AGENT=<name>
@@ -226,8 +216,10 @@ async function main(): Promise<void> {
         if (process.stdin.isTTY) fail('--stdin reads file names (one per line, or NUL-separated) from a pipe, e.g. `git diff --name-only | ceasefire check --stdin`');
         const input = await readStdin(MAX_STDIN_PATH_BYTES);
         if (input.overflow) fail('--stdin: more than 4MB of file names');
-        files = [...files, ...input.text.split(input.text.includes('\0') ? '\0' : '\n').map((l) => l.replace(/\r$/, '')).filter((l) => l.trim() !== '')];
+        files = [...files, ...(input.text.includes('\0') ? input.text.split('\0') : input.text.split('\n').map((l) => unquoteGitPath(l.replace(/\r$/, '')))).filter((l) => l.trim() !== '')];
       }
+      // Fail closed: an empty pipe may mean the upstream command failed, so "nothing to check" is an error, not "clear".
+      if (parsed.stdin && files.length === 0) fail('--stdin received no file names, so nothing was checked (an empty diff, or the command before the pipe failed). Exit 1 on purpose: an empty list is not a clear verdict.');
       return emit(cmdCheck(ctx, files, Date.now(), { claim: parsed.claim }));
     }
     case 'start': {
