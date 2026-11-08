@@ -21,6 +21,15 @@ export const BATCH_CHUNK = 256;
 const OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const OBJECT_NAME_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
+/**
+ * For a directory/file conflict git keeps both sides by writing one of them at `<path>~<object id>` (a real
+ * `git merge` writes `<path>~<branch>`). That name exists in no checkout and matches no claim, so report the path
+ * the agents actually touched. Only a full 40/64-hex suffix is stripped.
+ */
+export function cleanConflictPath(p: string): string {
+  return p.replace(/~[0-9a-f]{40}(?:[0-9a-f]{24})?$/, '');
+}
+
 /** Parse `merge-tree --stdin -z --name-only --no-messages` output; stops at the first incomplete or odd record. */
 export function parseMergeTreeStdin(stdout: string, expected: number): string[][] {
   const tokens = stdout.split('\0');
@@ -36,10 +45,12 @@ export function parseMergeTreeStdin(stdout: string, expected: number): string[][
       files.push(tokens[j] as string);
       j++;
     }
-    // A complete record ends with an empty token (the NUL NUL terminator); running off the end means truncation.
-    if (j >= tokens.length) break;
+    // A complete record ends with an empty token (the NUL NUL terminator) that is followed by one more token (the next
+    // record, or the empty rest of the stream). A stream that stops right after a file name looks like "name NUL" and would
+    // otherwise pass for a finished record that lists fewer files than git found.
+    if (j + 1 >= tokens.length) break;
     if (status === '1' && files.length > 0) break; // clean merges list no paths: anything else is not the format we know
-    out.push([...new Set(files)].sort());
+    out.push([...new Set(files.map(cleanConflictPath))].sort());
     i = j + 1;
   }
   return out;

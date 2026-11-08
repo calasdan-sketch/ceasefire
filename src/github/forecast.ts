@@ -8,6 +8,7 @@
  * not landed yet, and so tests can inject a fake.
  */
 import type { Collision, Intent } from './types.js';
+import { sanitizeDisplay } from '../cli/format.js';
 
 export type ForecastImpl = (
   repoDir: string,
@@ -36,7 +37,13 @@ export async function loadCoreForecast(spec: string = CORE_SPEC): Promise<Foreca
       `ceasefire core forecast module at ${spec} does not export buildCollisionMatrix(repo, branches, intents, now).`,
     );
   }
-  return fn as ForecastImpl;
+  const core = fn as (repo: string, branches: string[], intents: Intent[], now: number, onSkip?: (a: string, b: string, why: string) => void) => Collision[] | Promise<Collision[]>;
+  // A pair the forecast cannot look at must be visible in the workflow log, never silently "clear".
+  // Names come from other people's branches: control characters are removed so they cannot forge a workflow command.
+  return async (repo, branches, intents, now) =>
+    core(repo, branches, intents, now, (a, b, why) => {
+      console.log(`::warning title=ceasefire::could not forecast ${sanitizeDisplay(a)} <-> ${sanitizeDisplay(b)}: ${sanitizeDisplay(why)}`);
+    });
 }
 
 /** Run the forecast over local branch names. `impl` is injectable for tests. */

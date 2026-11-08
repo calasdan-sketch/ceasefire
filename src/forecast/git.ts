@@ -65,7 +65,9 @@ let quarantineEnv: NodeJS.ProcessEnv | null = null;
 export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const k of REDIRECTING_GIT_ENV) delete env[k];
-  return { ...env, ...(quarantineEnv ?? {}), ...extra };
+  // ceasefire recognises a few git messages ("unrelated histories", "dubious ownership"); a translated git must not change what it decides.
+  delete env['LANGUAGE'];
+  return { ...env, LC_ALL: 'C', ...(quarantineEnv ?? {}), ...extra };
 }
 
 /**

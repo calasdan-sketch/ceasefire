@@ -82,7 +82,7 @@ export function formatBlockedMessage(report: CheckReport): string {
       `Holder: agent "${sanitizeDisplay(c.holder)}" (branch ${sanitizeDisplay(c.branch)}, intent ${c.intentId.slice(0, 8)} — "${sanitizeDisplay(c.task)}", expires in ${formatDuration(c.expiresInMs)})`,
     );
     lines.push('Files in contention:');
-    for (const f of c.files) lines.push(`  - ${sanitizeDisplay(f)}`);
+    lines.push(...listFiles(c.files, '\n').split('\n').map((f) => `  - ${f}`));
     lines.push('');
   }
   lines.push('Recommended next actions:');
@@ -96,13 +96,22 @@ export function formatBlockedMessage(report: CheckReport): string {
   return lines.join('\n');
 }
 
+/** Names shown in one message. `check --stdin` can be fed tens of thousands of files, and an agent reads every byte of the answer. */
+export const MAX_LISTED_FILES = 20;
+
+function listFiles(files: string[], sep: string): string {
+  const shown = files.slice(0, MAX_LISTED_FILES).map(sanitizeDisplay);
+  const more = files.length - shown.length;
+  return shown.join(sep) + (more > 0 ? `${sep}… and ${more} more` : '');
+}
+
 export function formatClearMessage(files: string[]): string {
-  return `ceasefire: clear — no active intent overlaps ${files.length === 1 ? 'this file' : 'these files'}: ${files.map(sanitizeDisplay).join(', ')}`;
+  return `ceasefire: clear — no active intent overlaps ${files.length === 1 ? 'this file' : 'these files'}: ${listFiles(files, ', ')}`;
 }
 
 export function formatOverrideMessage(files: string[]): string {
   return (
-    `ceasefire: proceeding with CEASEFIRE_ALLOW_CONFLICT=1 — you accepted the merge-conflict risk on: ${files.map(sanitizeDisplay).join(', ')}. ` +
+    `ceasefire: proceeding with CEASEFIRE_ALLOW_CONFLICT=1 — you accepted the merge-conflict risk on: ${listFiles(files, ', ')}. ` +
     'Run `ceasefire suggest` if you would rather work on unclaimed files.'
   );
 }

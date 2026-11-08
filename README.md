@@ -43,7 +43,7 @@ ceasefire init --claude            # pre-push hook + workflow stub + Claude Code
 ceasefire doctor                   # what is installed, what is missing
 ```
 
-**Version note (checked 2026-11-07).** The npm name `ceasefire` resolves to 0.0.1, an early placeholder without
+**Version note (checked 2026-11-08).** The npm name `ceasefire` resolves to 0.0.1, an early placeholder without
 this code. Everything below describes 0.3.0. Until 0.3.0 is published, install from a checkout instead of `npm i -g`:
 
 ```sh
@@ -124,6 +124,12 @@ ceasefire done
 
 Exit codes: `0` clear · `1` error · `2` advisory · `3` hard block.
 `conflicts` exits `0` unless `--exit-code` is given (then `2` on any collision).
+
+**A gate never says "clear" about what it could not look at.** If git cannot merge a pair of branches (a missing object,
+a shallow clone), `conflicts --exit-code` prints which pairs and exits `1` instead of `0`; the `--json` output lists
+them under `unchecked`. The one exception is an orphan branch such as `gh-pages` (git: "unrelated histories"): it is
+listed as `unchecked` with `"expected": true`, warned about, and does not fail the gate. In a *shallow* clone every pair
+looks unrelated, so there nothing is treated as expected: run `git fetch --unshallow` (in CI, `fetch-depth: 0`).
 
 ### Paths: one file, one name
 
@@ -330,9 +336,8 @@ the `CEASEFIRE_ALLOW_CONFLICT=1` override.
 ## How it compares
 
 Competitor statements come from each project's own README (linked; Clash's and moire's READMEs were
-re-read on 2026-11-07; in round 4 GitHub was not reachable from the test machine, so they were not re-read again. The crates.io
-record of `clash-sh` showed its last update on 2026-02-08). The only competitor I ran is Clash 0.2.0 (timings
-above, measured in round 2; not re-run in round 3); everything else is unverified by me.
+re-read on 2026-11-08; the crates.io record of `clash-sh` still shows its last update on 2026-02-08, version 0.2.0). The only competitor I ran is Clash 0.2.0 (timings
+above, measured in round 2; not re-run since); everything else is unverified by me.
 
 | | ceasefire | [Clash](https://github.com/clash-sh/clash) | [moire](https://github.com/jamescazzetta/moire) | [AGNT-LOCK](https://github.com/codewithriza/AGNT-LOCK) | [agent-claim-mcp](https://github.com/vk0dev/agent-claim-mcp) | [mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail) |
 |---|---|---|---|---|---|---|
@@ -394,6 +399,7 @@ Honest limits:
 - **Windows has never been run.** Path handling, the `;` list separator for git object directories, CRLF input and
   `rename` over open files were reviewed in code and covered by path-fuzz tests only. If it misbehaves on Windows,
   that is a bug to report, not a documented limit.
+- Clash's README (re-read 2026-11-08) names macOS and Linux installers and does not mention Windows; ceasefire is plain Node and git, but see the Windows line above.
 - Only Node 22.23 was run for this release; 22.13 (the stated minimum) and Node 24 are untested here. Older Node
   prints one plain sentence and exits 1.
 - A checkout the current user does not own is refused by git ("dubious ownership", common in Docker); ceasefire now
@@ -436,7 +442,8 @@ Ceasefire coordinates **trusted-but-uncoordinated** agents. Know the boundaries:
 ## Dev
 
 ```sh
-npm test    # tsc + node:test, 265 tests (hermetic: ignores GITHUB_TOKEN, stays out of the parent repo)
+npm test    # tsc + node:test, 290 tests (hermetic: ignores GITHUB_TOKEN, stays out of the parent repo; written to run from cmd.exe, which has not been tried)
 npx tsc     # build -> dist/
+npm run mutation   # breaks 11 key conditions one at a time in a copy of the build and checks that the tests notice
 npm run bench   # accuracy (40 histories, as quoted above) + latency benchmarks (about 6 minutes)
 ```

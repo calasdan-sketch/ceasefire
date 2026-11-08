@@ -2,6 +2,49 @@
 
 ## 0.3.0 — unreleased (expert rounds 2 and 3)
 
+### Round 5 (fail closed, Windows-safe scripts, tests that compare against git itself)
+
+Panel: multi-agent git workflow engineer, merge-conflict researcher, Node/TypeScript packaging maintainer, Windows developer.
+Details, proving commands and the scored idea list: `docs/ROUND5.md`.
+
+#### Fixed
+- **`conflicts --exit-code` said "clear" about pairs it could not check.** A pair git could not merge (missing object,
+  unrelated histories) was only a stderr warning; the exit code was `0` and `--json` showed nothing. In a shallow clone
+  (the default of most CI checkouts) every pair looked "unrelated", so a gate passed having looked at nothing. Now
+  `--json` has an `unchecked` list, the text says "N could not be checked", a shallow clone is named as the cause
+  (`git fetch --unshallow`), and `--exit-code` exits `1` when anything unexpected was skipped. An orphan branch such as
+  `gh-pages` stays a warning (`"expected": true`). `doctor` warns about a shallow clone.
+- **The GitHub Action dropped unforecastable pairs silently**; they are now workflow warnings (control characters removed).
+- **A truncated `merge-tree --stdin` stream could pass as a finished record** that lists fewer conflicted files than git
+  found (if git is killed mid-write). A record now needs its terminator.
+- **A directory/file conflict was reported under a name that exists nowhere** (`lib~3cbd407e…`) instead of `lib`, so it
+  matched no claim.
+- `npm run prepack` used `rm -rf` and `npm test` used `mkdir -p` and `VAR=value cmd`: neither runs from Windows `cmd.exe`,
+  so `npm publish` from a Windows machine would have failed. Both are now Node scripts (`scripts/test.mjs`); the test
+  runner finds every `*.test.js` itself, so a new test file cannot be left out of a hand-kept list (the test tsconfig had
+  the same list).
+- `check --stdin` with 20,000 names printed a 224 KB "clear" message; answers now list 20 names and "… and N more" (the `--json` `files` array stays complete).
+- A bare repository was reported as "not a git repository"; it now says it is bare and how to proceed.
+- A clone with only remote-tracking branches printed "no collisions across 1 branch(es)"; it now says how many remote
+  branches were not compared.
+- git runs with `LC_ALL=C` so a translated git cannot change the few messages ceasefire reads (not testable here: no
+  translated git installed).
+- `--help` ends with "Maintained by Calas Automations Inc. · MIT license" (read from `package.json`); `action.yml` author
+  is now "Calas Automations Inc.".
+
+#### Added
+- `.gitattributes` (LF line endings, so the `#!/usr/bin/env node` line survives a Windows checkout), `.github/workflows/ci.yml`
+  (Linux, macOS, Windows x Node 22.13 and 24; has never run), `prepublishOnly` runs the tests, `npm run mutation`.
+- 25 tests (290 total): author pinned in package.json, LICENSE, `action.yml`, `--help` and the packed tarball; differential
+  test of the forecast against a real `git merge` (10 seeded histories, 60 pairs); the glob matcher against Node's
+  `path.matchesGlob` (4,000 cases); git-quoted names against `git ls-files -z`; golden files for the PR comment, terminal
+  messages and every `--json` shape (`test/golden/`, refresh with `UPDATE_GOLDEN=1`).
+- The mutation check broke 11 conditions; two survived at first (sibling-folder path check, merge failure treated as
+  "no conflict"); both now have tests.
+
+#### Not done / not tested
+- Windows and macOS were still not run. Node 22.13 and 24 were not run.
+
 ### Round 4 (what a stranger gets from `npm i`)
 
 Panel: first-time user on a clean prefix (path with a space), release/packaging engineer, supply-chain reviewer,

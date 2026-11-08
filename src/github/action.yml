@@ -39,7 +39,7 @@
 
 name: 'ceasefire collision forecast'
 description: 'Forecast merge collisions across open PRs and post the collision matrix as a PR comment'
-author: 'Calas Automations'
+author: 'Calas Automations Inc.'
 
 inputs:
   github-token:

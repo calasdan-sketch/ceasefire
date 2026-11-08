@@ -3,7 +3,7 @@
  * after it installs the warning filter, so node:sqlite's experimental
  * warning never pollutes agent-facing output.
  */
-import { VERSION } from '../version.js';
+import { VERSION, AUTHOR } from '../version.js';
 import { unquoteGitPath } from './gitquote.js';
 import { cmdCheck, cmdConflicts, cmdDoctor, cmdDone, cmdInit, cmdList, cmdStart, cmdStatus, cmdSuggest, parseTtl, type Ctx } from './commands.js';
 import { runClaudeHook, runReleaseHook, MAX_HOOK_INPUT_BYTES } from './hook.js';
@@ -162,6 +162,8 @@ Usage:
 Exit codes: 0 clear · 1 error · 2 advisory · 3 hard block (CEASEFIRE_STRICT=1)
 Env: CEASEFIRE_JSON=1 · CEASEFIRE_STRICT=1 · CEASEFIRE_ALLOW_CONFLICT=1 · CEASEFIRE_AGENT=<name>
      CEASEFIRE_DIR=<store dir> · CEASEFIRE_SYNC=0 (disable git-refs broadcast)
+
+Maintained by ${AUTHOR} · MIT license
 `;
 
 function fail(message: string): never {

@@ -25,7 +25,7 @@
  */
 import { git, gitResult, mergeBase, CeasefireGitError, withObjectQuarantine, resolveCommits } from './git.js';
 import { relatedTips, type Related } from './ancestry.js';
-import { mergeTreeBatch, gitSupportsMergeTreeStdin } from './batch.js';
+import { mergeTreeBatch, gitSupportsMergeTreeStdin, cleanConflictPath } from './batch.js';
 export { mergeBase } from './git.js';
 import type { Collision, Intent } from '../types.js';
 
@@ -103,7 +103,7 @@ export function mergeTreeConflictedFiles(cwd: string, ours: string, theirs: stri
   for (const record of result.stdout.split('\0')) {
     const staged = STAGED_PATH_RE.exec(record);
     if (staged?.[2] !== undefined) {
-      conflicted.add(staged[2]);
+      conflicted.add(cleanConflictPath(staged[2]));
       continue;
     }
     // Belt-and-braces: if git ever reports a conflict without a staged

@@ -1,0 +1,12 @@
+CEASEFIRE VERDICT: ADVISORY — another agent is actively working on these files.
+You are about to edit files that another agent has an active intent on. Editing them now risks a merge conflict you will have to resolve by hand.
+
+Holder: agent "builder" (branch feat/login, intent 1f0c9a2e — "refactor login", expires in 3h 59m)
+Files in contention:
+  - src/auth/session.ts
+
+Recommended next actions:
+  1. Pick different files: run `ceasefire suggest` for unclaimed alternatives you can work on now.
+  2. Coordinate with the holder ("builder") before touching these files.
+  3. Wait for the holder to release the intent (`ceasefire done`), or for it to expire.
+  4. Override only if you accept the merge-conflict risk: re-run with CEASEFIRE_ALLOW_CONFLICT=1.

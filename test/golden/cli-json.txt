@@ -1,0 +1,99 @@
+$ ceasefire start refactor --paths file.txt   (exit 0)
+{
+  "intent": {
+    "id": "<uuid>",
+    "agent": "builder",
+    "task": "refactor",
+    "branch": "main",
+    "paths": [
+      "file.txt"
+    ],
+    "createdAt": 0,
+    "expiresAt": 0,
+    "status": "active"
+  },
+  "contested": [],
+  "warnings": []
+}
+
+$ ceasefire check file.txt --json   (exit 2)
+{
+  "verdict": "advisory",
+  "files": [
+    "file.txt"
+  ],
+  "contentions": [
+    {
+      "holder": "builder",
+      "branch": "main",
+      "intentId": "<uuid>",
+      "task": "refactor",
+      "expiresInMs": 0,
+      "files": [
+        "file.txt"
+      ]
+    }
+  ],
+  "overridden": false,
+  "strict": false,
+  "message": "CEASEFIRE VERDICT: ADVISORY — another agent is actively working on these files.\nYou are about to edit files that another agent has an active intent on. Editing them now risks a merge conflict you will have to resolve by hand.\n\nHolder: agent \"builder\" (branch main, intent <id8> — \"refactor\", expires in <duration>)\nFiles in contention:\n  - file.txt\n\nRecommended next actions:\n  1. Pick different files: run `ceasefire suggest` for unclaimed alternatives you can work on now.\n  2. Coordinate with the holder (\"builder\") before touching these files.\n  3. Wait for the holder to release the intent (`ceasefire done`), or for it to expire.\n  4. Override only if you accept the merge-conflict risk: re-run with CEASEFIRE_ALLOW_CONFLICT=1."
+}
+
+$ ceasefire list --json   (exit 0)
+{
+  "intents": [
+    {
+      "id": "<uuid>",
+      "agent": "builder",
+      "task": "refactor",
+      "branch": "main",
+      "paths": [
+        "file.txt"
+      ],
+      "createdAt": 0,
+      "expiresAt": 0,
+      "status": "active"
+    }
+  ],
+  "generatedAt": 0
+}
+
+$ ceasefire status --json   (exit 0)
+{
+  "agents": [
+    {
+      "agent": "builder",
+      "branches": [
+        "main"
+      ],
+      "paths": [
+        "file.txt"
+      ],
+      "expiresInMs": 0
+    }
+  ],
+  "contested": [],
+  "generatedAt": 0
+}
+
+$ ceasefire conflicts --json   (exit 0)
+{
+  "branches": [
+    "main",
+    "one",
+    "two"
+  ],
+  "collisionCount": 1,
+  "collisions": [
+    {
+      "prA": "one",
+      "prB": "two",
+      "files": [
+        "file.txt"
+      ],
+      "severity": "textual"
+    }
+  ],
+  "unchecked": [],
+  "generatedAt": 0
+}

@@ -1,0 +1,29 @@
+# Runs the tests on Linux, macOS and Windows. It has never run yet: it starts working the first time this repository is
+# pushed to GitHub. A red Windows or macOS job is information, not a mistake in this file: those systems have never
+# been tried (see docs/ROUND5.md).
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['22.13.0', '24']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: git config --global user.email ci@example.invalid && git config --global user.name ci
+      - run: npm ci
+      - run: npm test
+      - run: npm audit --omit=dev
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'

@@ -177,6 +177,9 @@ export function notRepoMessage(cwd: string, then: string): string {
   if (/dubious ownership/i.test(r.stderr)) {
     return `git refuses to open this repository because it belongs to another user ("dubious ownership"). If you trust it, run: git config --global --add safe.directory "${cwd}"`;
   }
+  if (tryGit(cwd, ['rev-parse', '--is-bare-repository']) === 'true') {
+    return `this is a bare repository (it has no checked-out files), and ceasefire works inside a working copy. Run it in a clone or in a worktree: git worktree add ../work <branch>`;
+  }
   return `not a git repository. ${then}`;
 }
 
@@ -602,6 +605,8 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
   let branches: string[] = [];
   let worktrees: Array<{ path: string; branch: string | null; label: string; dirty: boolean }> | undefined;
   const skipped: string[] = [];
+  /** Pairs/worktrees the forecast could not look at. "Unrelated histories" (an orphan branch such as gh-pages) is expected and never fails a gate; anything else does. */
+  const unchecked: Array<{ a: string; b: string; reason: string; expected: boolean }> = [];
   let store: IntentStore;
   try {
     store = openStore(ctx.cwd);
@@ -623,7 +628,10 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
     if (opts.worktrees) {
       const wf = forecastWorktrees(ctx.cwd, { includeUntracked: opts.untracked ?? false });
       worktrees = wf.worktrees.map((w) => ({ path: w.path, branch: w.branch, label: w.label, dirty: w.dirty }));
-      for (const sk of wf.skipped) skipped.push(`ceasefire: warning — skipped worktree ${sanitizeDisplay(sk.worktree)}: ${sanitizeDisplay(sk.reason)}`);
+      for (const sk of wf.skipped) {
+        skipped.push(`ceasefire: warning — skipped worktree ${sanitizeDisplay(sk.worktree)}: ${sanitizeDisplay(sk.reason)}`);
+        unchecked.push({ a: sk.worktree, b: '', reason: sk.reason, expected: false });
+      }
       if (wf.worktrees.length === 0) {
         return err('no worktree could be snapshotted; nothing was forecast (see warnings).' + (skipped.length ? '\n' + skipped.join('\n') : ''));
       }
@@ -642,7 +650,8 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
       const tipOf = resolveCommits(ctx.cwd, branches);
       related = relatedTips(ctx.cwd, [...tipOf.values()]);
       collisions = buildCollisionMatrix(ctx.cwd, branches, intents, now, (a, b, reason) => {
-        skipped.push(`ceasefire: warning — could not forecast ${sanitizeDisplay(a)} <-> ${sanitizeDisplay(b)}: ${sanitizeDisplay(reason)}`);
+        skipped.push(`ceasefire: warning — could not forecast ${sanitizeDisplay(a)} <-> ${sanitizeDisplay(b)}: ${sanitizeDisplay(reason.replace(/^ceasefire: /, ''))}`);
+        unchecked.push({ a, b, reason: reason.replace(/^ceasefire: /, ''), expected: /unrelated histories/i.test(reason) });
       }, match, related);
       if (opts.overlap || opts.semantic || opts.neighbors) {
         for (const [label, oid] of tipOf) deepRefs.push({ label, oid });
@@ -662,9 +671,28 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
       for (const n of deep.notes) skipped.push(`ceasefire: note — ${sanitizeDisplay(n)}`);
     }
     collisions = annotateRegenerable(collisions);
-    const stderr = skipped.length > 0 ? skipped.join('\n') + '\n' : undefined;
     const counted = opts.ignoreRegenerable ? collisions.filter((c) => !c.regenerable) : collisions;
-    const exitCode = opts.exitCode && counted.length > 0 ? EXIT_ADVISORY : EXIT_CLEAR;
+    // A shallow clone (the default of most CI checkouts) makes related branches look unrelated: never "expected" there.
+    if (unchecked.some((u) => u.expected) && tryGit(ctx.cwd, ['rev-parse', '--is-shallow-repository']) === 'true') {
+      for (const u of unchecked) {
+        if (!u.expected) continue;
+        u.expected = false;
+        u.reason = 'this is a shallow clone, so history is missing and branches look unrelated; run `git fetch --unshallow` (in CI: fetch-depth: 0)';
+      }
+      skipped.push('ceasefire: warning — this repository is a shallow clone; the branch forecast is incomplete. Run `git fetch --unshallow`.');
+    }
+    if (!worktrees && branches.length < 2) {
+      const remotes = tryGit(ctx.cwd, ['for-each-ref', '--format=%(refname:short)', 'refs/remotes/']);
+      const n = remotes ? remotes.split('\n').filter((r) => r && !r.endsWith('/HEAD')).length : 0;
+      if (n > 0) skipped.push(`ceasefire: note — ${branches.length} local branch(es) compared; ${n} remote-tracking branch(es) are not. Create local branches (git branch <name> origin/<name>) to include them.`);
+    }
+    const unsafe = unchecked.filter((u) => !u.expected);
+    // Fail closed: a gate must not say "clear" about pairs it could not look at.
+    const gateFailed = opts.exitCode === true && counted.length === 0 && unsafe.length > 0;
+    const exitCode = opts.exitCode && counted.length > 0 ? EXIT_ADVISORY : gateFailed ? EXIT_ERROR : EXIT_CLEAR;
+    const stderr = skipped.length > 0 || gateFailed
+      ? [...skipped, ...(gateFailed ? [`ceasefire: error — ${unsafe.length} pair(s) could not be checked, so "no collisions" cannot be promised (exit 1).`] : [])].join('\n') + '\n'
+      : undefined;
     const scope = worktrees
       ? `${worktrees.length} worktree(s) (${worktrees.filter((w) => w.dirty).length} with uncommitted changes)`
       : `${branches.length} branch(es)`;
@@ -677,6 +705,7 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
               ...(worktrees ? { worktrees } : { branches }),
               collisionCount: collisions.length,
               collisions,
+              unchecked: unchecked.map((u) => ({ a: u.a, ...(u.b ? { b: u.b } : {}), reason: u.reason, expected: u.expected })),
               generatedAt: now,
             },
             null,
@@ -688,7 +717,9 @@ export function cmdConflicts(ctx: Ctx, now: number = Date.now(), opts: Conflicts
     if (collisions.length === 0) {
       return {
         exitCode,
-        stdout: `ceasefire: no collisions across ${scope}.\n`,
+        stdout: unchecked.length > 0
+          ? `ceasefire: no collisions in the pairs that could be checked across ${scope}; ${unchecked.length} could not be checked (see warnings).\n`
+          : `ceasefire: no collisions across ${scope}.\n`,
         ...(stderr !== undefined ? { stderr } : {}),
       };
     }
@@ -1143,6 +1174,9 @@ export function cmdDoctor(ctx: Ctx, now: number = Date.now()): CommandResult {
     add('repository', 'fail', 'not inside a git repository');
   } else {
     add('repository', 'ok', sanitizeDisplay(root));
+    if (tryGit(ctx.cwd, ['rev-parse', '--is-shallow-repository']) === 'true') {
+      add('history', 'warn', 'this is a shallow clone: branches look unrelated and `ceasefire conflicts` cannot forecast them. Run `git fetch --unshallow` (in CI: fetch-depth: 0)');
+    }
     try {
       const store = openStore(ctx.cwd);
       try {
